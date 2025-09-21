@@ -19,6 +19,13 @@ from tinygrad.uop.ops import exec_alu, Ops, UOp, GroupOp
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 
+import sys, numpy as np
+np.set_printoptions(threshold=sys.maxsize, linewidth=1000, suppress=False)
+
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+
 def storage_fmt_for_dtype(dtype: DType): return 'H' if dtype == dtypes.bfloat16 else dtype.fmt
 
 def to_storage_scalar(x, dtype: DType):
@@ -44,6 +51,16 @@ def _store(m, i, v, dtype: DType):
 
 class RockchipRenderer(Renderer):
   device = "ROCKCHIP"
+  code_for_op = {
+    # Ops.MAX: 0, 
+    Ops.ADD: 2, 
+    # Ops.FDIV: 3, 
+    # Ops.IDIV: 3, 
+    # Ops.SUB: 4, 
+    # Ops.NEG: 6, 
+    Ops.MUL: None
+    }
+
   def render(self, uops:list[UOp]) -> str:
     # the value of SPECIAL comes from local/global_size, not form its source
     lops = [(u.op, u.dtype, [uops.index(v) for v in u.src if u.op is not Ops.SPECIAL], u.arg) for u in uops]
@@ -51,11 +68,35 @@ class RockchipRenderer(Renderer):
 
 
 class RockchipDevice(Compiled):
-  
+  def create_flink_name(self, handle: int) -> int:
+    """
+    Create a flink name for a GEM handle using DRM_IOCTL_GEM_FLINK.
+    Args:
+      handle: The GEM handle to create a flink name for
+      
+    Returns:
+      The flink name (uint32) on success, raises exception on failure
+    """
+    flink_req = rk.struct_drm_gem_flink(handle=handle, name=0)
+    
+    try:
+      result = rk.DRM_IOCTL_GEM_FLINK(self.fd_ctl, __payload=flink_req)
+      
+      print(f"SUCCESS: Created flink name {flink_req.name} for handle {handle}")
+      return flink_req.name
+    except Exception as e:
+      print(f"ERROR: DRM_IOCTL_GEM_FLINK failed: {e}")
+      raise
+
   def _gpu_alloc(self, size:int, flags) -> HCQBuffer:
     mem_create = rk.DRM_IOCTL_RKNPU_MEM_CREATE(self.fd_ctl, size=size, flags=flags | rk.RKNPU_MEM_NON_CACHEABLE)
     mem_map = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.fd_ctl, handle=mem_create.handle, offset=0)    
     va_addr = self.fd_ctl.mmap(0, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, mem_map.offset)
+
+    # Create flink name for the GEM handle
+    flink_name = self.create_flink_name(mem_create.handle)
+    # Store flink name in meta for later use
+    mem_create.flink_name = flink_name
 
     return HCQBuffer(va_addr=va_addr, size=size, meta=mem_create)
 
@@ -69,7 +110,8 @@ class RockchipDevice(Compiled):
     self.output_buf = None
 
     self.buffer_list = []
-    
+    self.code_for_op = RockchipRenderer.code_for_op
+
     super().__init__(device, RockchipAllocator(self), RockchipRenderer(), RockchipCompiler(), functools.partial(RockchipProgram, self))
 
   def add_buffer(self, size):
@@ -198,8 +240,7 @@ class RockchipProgram:
         self.reg(1, rk.DPU_EW_CFG_EW_OP_TYPE__SHIFT, rk.DPU_EW_CFG_EW_OP_TYPE__MASK) |
         self.reg(0, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK) |
         self.reg(0, rk.DPU_EW_CFG_EW_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_BYPASS__MASK))
-  
-    if op == Ops.ADD:
+    elif op in self.code_for_op.keys():
       self.emit_raw(rk.DPU, rk.REG_DPU_EW_CFG,
         self.reg(0, rk.DPU_EW_CFG_EW_CVT_TYPE__SHIFT, rk.DPU_EW_CFG_EW_CVT_TYPE__MASK) |
         self.reg(0, rk.DPU_EW_CFG_EW_CVT_ROUND__SHIFT, rk.DPU_EW_CFG_EW_CVT_ROUND__MASK) |
@@ -207,7 +248,7 @@ class RockchipProgram:
         self.reg(self.get_edata_size(dtype), rk.DPU_EW_CFG_EDATA_SIZE__SHIFT, rk.DPU_EW_CFG_EDATA_SIZE__MASK) |
         self.reg(0, rk.DPU_EW_CFG_EW_EQUAL_EN__SHIFT, rk.DPU_EW_CFG_EW_EQUAL_EN__MASK) |
         self.reg(0, rk.DPU_EW_CFG_EW_BINARY_EN__SHIFT, rk.DPU_EW_CFG_EW_BINARY_EN__MASK) |
-        self.reg(2, rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT, rk.DPU_EW_CFG_EW_ALU_ALGO__MASK) |
+        self.reg(self.code_for_op[op], rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT, rk.DPU_EW_CFG_EW_ALU_ALGO__MASK) |
         self.reg(0, rk.DPU_EW_CFG_EW_RELUX_EN__SHIFT, rk.DPU_EW_CFG_EW_RELUX_EN__MASK) |
         self.reg(1, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
         self.reg(0, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
@@ -231,7 +272,8 @@ class RockchipProgram:
   def create_size(self, height, width):
     self.emit_raw(rk.DPU, rk.REG_DPU_WDMA_SIZE_1,
       self.reg(height, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__MASK) |
-      self.reg(width, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__MASK))
+      # self.reg(width, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__MASK))
+      self.reg(0, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__MASK))
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,
       self.reg(width, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__MASK))
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,
@@ -316,7 +358,8 @@ class RockchipProgram:
 
 
     self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH,
-      self.reg(9, rk.DPU_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_DATA_CUBE_WIDTH_WIDTH__MASK))
+      # self.reg(9, rk.DPU_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_DATA_CUBE_WIDTH_WIDTH__MASK))
+      self.reg(0, rk.DPU_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_DATA_CUBE_WIDTH_WIDTH__MASK))
 
     self.emit_raw(rk.DPU, rk.REG_DPU_DST_SURF_STRIDE,
       self.reg(12, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__SHIFT, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__MASK))
@@ -398,6 +441,7 @@ class RockchipProgram:
     self.uops: list[tuple[Ops, DType|None, list[int], Any]] = pickle.loads(lib)
     self.device = dev
     self.q = []
+    self.code_for_op = RockchipRenderer.code_for_op
     print('enter init')
 
 
@@ -491,7 +535,9 @@ class RockchipProgram:
           assert all_same([len(x) for x in inp]), f"{[len(x) for x in inp]} doesn't match on {uop}"
           assert all_same([dtype] + dtp) or uop in {Ops.CMPNE, Ops.CMPLT, Ops.WHERE}, f"dtype mismatch on {uop}"
 
-          if (len(inp) == 2 and (dtype == dtypes.int8 or dtype == dtypes.int32 or dtype == dtypes.int16 or dtype == dtypes.float or dtype == dtypes.float16) and (uop == Ops.MUL or uop == Ops.ADD)):
+          if (len(inp) == 2 
+            and (dtype in (dtypes.int8, dtypes.int16, dtypes.int32, dtypes.int, dtypes.float, dtypes.float16))
+            and (uop in RockchipRenderer.code_for_op.keys())):
 
    
             self.device.add_buffer(len(inp[0]))
@@ -539,14 +585,19 @@ class RockchipProgram:
           
             self.submit()
             ctypes.memmove(dst.ctypes.data, self.output_buf.va_addr, self.output_buf.size * dtype.itemsize)
-            # print("inp[0]", inp[0])
+            # print("inp[0]", inp[0])            
             # print(uop)
             # print("inp[1]", inp[1])
             # print('dst', dst.tolist())
             ul[i] = dst.tolist()
           else:
-            print('OPERATION NOT SUPPORTED, FALLBACK TO CPU', uop, dtype)
-            ul[i] = [exec_alu(uop, dtype, p) for p in zip(*inp)]
+            # CMPNE AND OR could be supported by NPU, need test
+            if uop in (Ops.CMPEQ, Ops.CMPNE, Ops.XOR, Ops.AND, Ops.OR, Ops.TRUNC):
+              print('ALLOWED FALLBACK TO CPU', uop, dtype)
+              ul[i] = [exec_alu(uop, dtype, p) for p in zip(*inp)]
+            else:
+              print('EXIT OPERATION NOT SUPPORTED', uop, dtype)
+              exit()
         assert i in ul, (uop, dtype, idp, arg)
         i += 1
     return time.perf_counter() - st
