@@ -138,7 +138,8 @@ class RockchipProgram:
     packed_value = ((target & 0xFFFF) << 48) | ((value & 0xFFFFFFFF) << 16) | (reg & 0xFFFF)
 
     self.q.append(packed_value)
-  def get_precision(self, dtype):
+  
+  def get_precision(self, dtype, fp32out=False):
     # 3'd0: Integer 8bit; 
     # 3'd1: Integer 16bit; 
     # 3'd2: Float point 16bit; 
@@ -152,7 +153,10 @@ class RockchipProgram:
     elif dtype == dtypes.int16:
       return 1
     elif dtype == dtypes.float16:
-      return 2
+      if fp32out:
+        return 5
+      else:
+        return 2
     elif dtype == dtypes.bfloat16:
       return 3
     elif dtype == dtypes.int32:
@@ -182,8 +186,10 @@ class RockchipProgram:
     return dtype == dtypes.float16 or dtype == dtypes.float
 
   def ops(self, op, dtype):
+    print(op, dtype, self.get_precision(dtype), op==Ops.ADD)
 
     self.emit_raw(rk.DPU, rk.REG_DPU_DATA_FORMAT,
+      # self.reg(self.get_precision(dtype, fp32out=op==Ops.ADD), rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
       self.reg(self.get_precision(dtype), rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
       self.reg(self.get_precision(dtype), rk.DPU_DATA_FORMAT_IN_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_IN_PRECISION__MASK) |
       self.reg(self.get_precision(dtype), rk.DPU_DATA_FORMAT_PROC_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_PROC_PRECISION__MASK))
@@ -200,6 +206,7 @@ class RockchipProgram:
 
     self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE, 
       self.reg(self.get_is_fp16(dtype), rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__SHIFT, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__MASK) |
+      # self.reg(0, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__SHIFT, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__MASK) |
       self.reg(1, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK));
 
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
@@ -304,6 +311,9 @@ class RockchipProgram:
 
     # Skip Transpose
     self.emit_raw(rk.DPU, rk.REG_DPU_BS_OW_CFG,
+      # self.reg(3, rk.DPU_BS_OW_CFG_SIZE_E_2__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_2__MASK) |
+      # self.reg(3, rk.DPU_BS_OW_CFG_SIZE_E_1__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_1__MASK) |
+      # self.reg(3, rk.DPU_BS_OW_CFG_SIZE_E_0__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_0__MASK) |
       self.reg(1, rk.DPU_BS_OW_CFG_OD_BYPASS__SHIFT, rk.DPU_BS_OW_CFG_OD_BYPASS__MASK))
     # Skip Transpose
     self.emit_raw(rk.DPU, rk.REG_DPU_BS_OW_OP,
@@ -433,6 +443,7 @@ class RockchipProgram:
                 rk.struct_rknpu_subcore_task(task_start=2, task_number=0),
             )
     )
+
     res = rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,   
             __payload=submit_res
     )
@@ -554,7 +565,9 @@ class RockchipProgram:
               ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
               src2 = memoryview(bytearray(np.float16(inp[1]).tobytes()))
               ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+              # FIX ME
               dst = np.frombuffer((bytearray(self.output_buf.size * dtypes.float16.itemsize)), dtype=np.float16)
+              # dst = np.frombuffer((bytearray(self.output_buf.size * dtypes.float32.itemsize)), dtype=np.float32)
               
               self.ops(uop, dtypes.float16)
    
@@ -588,7 +601,7 @@ class RockchipProgram:
             # print("inp[0]", inp[0])            
             # print(uop)
             # print("inp[1]", inp[1])
-            # print('dst', dst.tolist())
+            # print("dst", dst.tolist())
             ul[i] = dst.tolist()
           else:
             # CMPNE AND OR could be supported by NPU, need test
