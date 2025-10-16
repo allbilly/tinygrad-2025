@@ -26,14 +26,18 @@ import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
-def storage_fmt_for_dtype(dtype: DType): return 'H' if dtype == dtypes.bfloat16 else dtype.fmt
+def storage_fmt_for_dtype(dtype: DType):
+  if dtype in (dtypes.bfloat16, dtypes.float16): return 'H'
+  return dtype.fmt
 
 def to_storage_scalar(x, dtype: DType):
   if dtype == dtypes.bfloat16: return (struct.unpack('I', struct.pack('f', float_to_bf16(x)))[0] >> 16) & 0xFFFF
+  if dtype == dtypes.float16: return int(np.float16(x).view(np.uint16))
   return x
 
 def from_storage_scalar(x, dtype: DType):
   if dtype == dtypes.bfloat16: return struct.unpack('f', struct.pack('I', (x & 0xFFFF) << 16))[0]
+  if dtype == dtypes.float16: return float(np.uint16(x).view(np.float16))
   return x
 
 def _load(m, i, dtype: DType):
@@ -453,14 +457,150 @@ class RockchipProgram:
     self.device = dev
     self.q = []
     self.code_for_op = RockchipRenderer.code_for_op
+    self._alu_cache: dict[int, list[float]] = {}
+    self._alu_offsets: dict[int, int] = {}
+    self._fp16_add_plan: dict[str, Any]|None = None
     print('enter init')
 
+  def _buffer_nbytes(self, buf) -> int:
+    if isinstance(buf, HCQBuffer): return buf.size
+    mv = memoryview(buf)
+    return mv.nbytes
+
+  def _buffer_as_bytes(self, buf, nbytes:int) -> memoryview:
+    if isinstance(buf, HCQBuffer):
+      return to_mv(ctypes.cast(int, buf.va_addr), nbytes)
+    mv = memoryview(buf)
+    if mv.format != 'B': mv = mv.cast('B')
+    if mv.nbytes < nbytes: raise ValueError(f"buffer too small ({mv.nbytes}) for requested bytes {nbytes}")
+    return mv[:nbytes]
+
+  def _trace_define_global(self, idx:int) -> int|None:
+    seen:set[int] = set()
+    while idx not in seen:
+      seen.add(idx)
+      uop, _, srcs, _ = self.uops[idx]
+      if uop is Ops.DEFINE_GLOBAL: return idx
+      if uop in (Ops.LOAD, Ops.INDEX, Ops.CAST, Ops.BITCAST, Ops.GEP):
+        if not srcs: return None
+        idx = srcs[0]
+        continue
+      return None
+    return None
+
+  def _plan_fp16_add(self, global_bufs:dict[int, Any]) -> dict[str, Any]|None:
+    add_idxs: list[int] = []
+    add_dtype = None
+    add_srcs: list[int] = []
+    store_idx: int|None = None
+    value_idx: int|None = None
+    for idx, (op, _, srcs, _) in enumerate(self.uops):
+      if op is not Ops.STORE or len(srcs) < 2: continue
+      data_idx = srcs[1]
+      data_op, data_dtype, data_srcs, _ = self.uops[data_idx]
+      candidate_adds = []
+      if data_op is Ops.VECTORIZE:
+        candidate_adds = data_srcs
+      elif data_op is Ops.ADD:
+        candidate_adds = [data_idx]
+      if not candidate_adds: continue
+      valid = True
+      for add_idx in candidate_adds:
+        op_add, dtype_add, srcs_add, _ = self.uops[add_idx]
+        if op_add is not Ops.ADD or dtype_add not in (dtypes.float, dtypes.float16):
+          valid = False
+          break
+      if not valid: continue
+      add_idxs = candidate_adds
+      add_dtype = self.uops[candidate_adds[0]][1]
+      add_srcs = self.uops[candidate_adds[0]][2]
+      store_idx = idx
+      value_idx = data_idx
+      break
+    if store_idx is None or value_idx is None or not add_idxs: return None
+    store_srcs = self.uops[store_idx][2]
+    if len(store_srcs) < 2: return None
+    dst_define = self._trace_define_global(store_srcs[0])
+    if dst_define is None or dst_define not in global_bufs: return None
+    src_defines: list[int] = []
+    for src_idx in add_srcs:
+      traced = self._trace_define_global(src_idx)
+      if traced is None or traced not in global_bufs: return None
+      src_defines.append(traced)
+    dst_dtype = self.uops[dst_define][1]
+    if not isinstance(dst_dtype, PtrDType) or dst_dtype.size <= 0: return None
+    src_dtypes = []
+    for define_idx in src_defines:
+      define_dtype = self.uops[define_idx][1]
+      if not isinstance(define_dtype, PtrDType): return None
+      src_dtypes.append(define_dtype.base)
+    dst_bytes_expected = dst_dtype.size * dst_dtype.base.itemsize
+    if self._buffer_nbytes(global_bufs[dst_define]) < dst_bytes_expected: return None
+    primary_idx = add_idxs[0]
+    return {
+      "add_idx": primary_idx,
+      "add_indices": tuple(add_idxs),
+      "add_dtype": add_dtype,
+      "store_idx": store_idx,
+      "dst_define": dst_define,
+      "src_defines": tuple(src_defines),
+      "dst_dtype": dst_dtype,
+      "src_dtypes": tuple(src_dtypes),
+      "elements": dst_dtype.size,
+    }
+
+  def _execute_fp16_add(self, global_bufs:dict[int, Any], uop_idx:int, dtype:DType) -> list[float]:
+    plan = self._fp16_add_plan
+    indices = ()
+    if plan is not None:
+      indices = plan.get("add_indices", (plan.get("add_idx"),))
+    if plan is None or uop_idx not in indices:
+      plan = self._plan_fp16_add(global_bufs)
+      if plan is None: return []
+      indices = plan.get("add_indices", (plan.get("add_idx"),))
+      if uop_idx not in indices: return []
+    elements:int = plan["elements"]
+    if elements <= 0: return []
+    calc_dtype = dtypes.float16
+    size_bytes = elements * calc_dtype.itemsize
+    self.device.add_buffer(size_bytes)
+    self.input_buf = self.device.input_buf
+    self.weight_buf = self.device.weight_buf
+    self.output_buf = self.device.output_buf
+    self.create_reg()
+    sources = []
+    for define_idx, src_dtype in zip(plan["src_defines"], plan["src_dtypes"]):
+      src_bytes = self._buffer_as_bytes(global_bufs[define_idx], elements * src_dtype.itemsize)
+      np_dtype = np.float32 if src_dtype == dtypes.float else np.float16
+      src_arr = np.frombuffer(src_bytes, dtype=np_dtype, count=elements)
+      sources.append(src_arr.astype(np.float16, copy=False))
+    src0_bytes = bytearray(sources[0].tobytes())
+    src1_bytes = bytearray(sources[1].tobytes())
+    ctypes.memmove(self.input_buf.va_addr, mv_address(memoryview(src0_bytes)), len(src0_bytes))
+    ctypes.memmove(self.weight_buf.va_addr, mv_address(memoryview(src1_bytes)), len(src1_bytes))
+    self.ops(Ops.ADD, calc_dtype)
+    self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
+      self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
+    self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
+      self.reg(self.input_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
+    self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
+      self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
+    self.submit()
+    dst_bytes = bytearray(size_bytes)
+    ctypes.memmove(mv_address(memoryview(dst_bytes)), self.output_buf.va_addr, size_bytes)
+    return np.frombuffer(dst_bytes, dtype=np.float16, count=elements).astype(np.float16, copy=False).tolist()
 
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
     st = time.perf_counter()
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)
+    self._alu_cache.clear()
+    self._alu_offsets.clear()
+    define_indices = [idx for idx, uop in enumerate(self.uops) if uop[0] is Ops.DEFINE_GLOBAL]
+    global_bufs = {idx: bufs[pos] for pos, idx in enumerate(define_indices)}
+    fp16_add_plan = self._plan_fp16_add(global_bufs)
+    self._fp16_add_plan = fp16_add_plan
     for idxs in itertools.product(*[range(x) for x in global_size[::-1]]):
       ul: dict[int, Any] = {}
       dl: dict[int, DType] = {}
@@ -545,8 +685,33 @@ class RockchipProgram:
         elif uop in GroupOp.ALU:
           assert all_same([len(x) for x in inp]), f"{[len(x) for x in inp]} doesn't match on {uop}"
           assert all_same([dtype] + dtp) or uop in {Ops.CMPNE, Ops.CMPLT, Ops.WHERE}, f"dtype mismatch on {uop}"
+          handled = False
 
-          if (len(inp) == 2 
+          if fp16_add_plan is not None:
+            add_indices = fp16_add_plan.get("add_indices", (fp16_add_plan["add_idx"],))
+            plan_key = add_indices[0]
+          else:
+            add_indices = ()
+            plan_key = None
+
+          if (fp16_add_plan is not None and i in add_indices and len(inp) == 2 and
+              dtype in (dtypes.float, dtypes.float16)):
+            cache = self._alu_cache.get(plan_key)
+            if cache is None:
+              cache = self._execute_fp16_add(global_bufs, plan_key, dtype)
+              self._alu_cache[plan_key] = cache
+              self._alu_offsets[plan_key] = 0
+            chunk = len(inp[0])
+            start_off = self._alu_offsets[plan_key]
+            end_off = start_off + chunk
+            ul[i] = cache[start_off:end_off]
+            self._alu_offsets[plan_key] = end_off
+            if self._alu_offsets[plan_key] >= len(cache):
+              self._alu_cache.pop(plan_key, None)
+              self._alu_offsets.pop(plan_key, None)
+            handled = True
+
+          if not handled and (len(inp) == 2 
             and (dtype in (dtypes.int8, dtypes.int16, dtypes.int32, dtypes.int, dtypes.float, dtypes.float16))
             and (uop in RockchipRenderer.code_for_op.keys())):
 
@@ -565,9 +730,7 @@ class RockchipProgram:
               ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
               src2 = memoryview(bytearray(np.float16(inp[1]).tobytes()))
               ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-              # FIX ME
               dst = np.frombuffer((bytearray(self.output_buf.size * dtypes.float16.itemsize)), dtype=np.float16)
-              # dst = np.frombuffer((bytearray(self.output_buf.size * dtypes.float32.itemsize)), dtype=np.float32)
               
               self.ops(uop, dtypes.float16)
    
@@ -598,21 +761,23 @@ class RockchipProgram:
           
             self.submit()
             ctypes.memmove(dst.ctypes.data, self.output_buf.va_addr, self.output_buf.size * dtype.itemsize)
-            # print("inp[0]", inp[0])            
-            # print(uop)
-            # print("inp[1]", inp[1])
-            # print("dst", dst.tolist())
             ul[i] = dst.tolist()
-          else:
-            # CMPNE AND OR could be supported by NPU, need test
-            if uop in (Ops.CMPEQ, Ops.CMPNE, Ops.XOR, Ops.AND, Ops.OR, Ops.TRUNC):
+            handled = True
+
+          if not handled:
+            if uop == Ops.ADD and dtype == dtypes.uint:
+              ul[i] = [exec_alu(uop, dtype, p) for p in zip(*inp)]
+            elif uop == Ops.MUL and dtype == dtypes.uint:
+              ul[i] = [exec_alu(uop, dtype, p) for p in zip(*inp)]
+            elif uop in (Ops.CMPEQ, Ops.CMPNE, Ops.XOR, Ops.AND, Ops.OR, Ops.TRUNC):
               print('ALLOWED FALLBACK TO CPU', uop, dtype)
               ul[i] = [exec_alu(uop, dtype, p) for p in zip(*inp)]
             else:
-              print('EXIT OPERATION NOT SUPPORTED', uop, dtype)
-              exit()
+              print('FALLBACK TO CPU', uop, dtype)
+              ul[i] = [exec_alu(uop, dtype, p) for p in zip(*inp)]
         assert i in ul, (uop, dtype, idp, arg)
         i += 1
+    self._fp16_add_plan = None
     return time.perf_counter() - st
 
 class RockchipRegisterAllocator(HCQAllocatorBase):
