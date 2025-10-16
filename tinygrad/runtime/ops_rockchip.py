@@ -190,7 +190,7 @@ class RockchipProgram:
     return dtype == dtypes.float16 or dtype == dtypes.float
 
   def ops(self, op, dtype):
-    print(op, dtype, self.get_precision(dtype), op==Ops.ADD)
+    # print(op, dtype, self.get_precision(dtype), op==Ops.ADD)
 
     self.emit_raw(rk.DPU, rk.REG_DPU_DATA_FORMAT,
       # self.reg(self.get_precision(dtype, fp32out=op==Ops.ADD), rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
@@ -562,33 +562,48 @@ class RockchipProgram:
     elements:int = plan["elements"]
     if elements <= 0: return []
     calc_dtype = dtypes.float16
-    size_bytes = elements * calc_dtype.itemsize
-    self.device.add_buffer(size_bytes)
-    self.input_buf = self.device.input_buf
-    self.weight_buf = self.device.weight_buf
-    self.output_buf = self.device.output_buf
-    self.create_reg()
     sources = []
     for define_idx, src_dtype in zip(plan["src_defines"], plan["src_dtypes"]):
       src_bytes = self._buffer_as_bytes(global_bufs[define_idx], elements * src_dtype.itemsize)
       np_dtype = np.float32 if src_dtype == dtypes.float else np.float16
       src_arr = np.frombuffer(src_bytes, dtype=np_dtype, count=elements)
       sources.append(src_arr.astype(np.float16, copy=False))
-    src0_bytes = bytearray(sources[0].tobytes())
-    src1_bytes = bytearray(sources[1].tobytes())
-    ctypes.memmove(self.input_buf.va_addr, mv_address(memoryview(src0_bytes)), len(src0_bytes))
-    ctypes.memmove(self.weight_buf.va_addr, mv_address(memoryview(src1_bytes)), len(src1_bytes))
-    self.ops(Ops.ADD, calc_dtype)
-    self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
-      self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
-    self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
-      self.reg(self.input_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
-    self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
-      self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
-    self.submit()
-    dst_bytes = bytearray(size_bytes)
-    ctypes.memmove(mv_address(memoryview(dst_bytes)), self.output_buf.va_addr, size_bytes)
-    return np.frombuffer(dst_bytes, dtype=np.float16, count=elements).astype(np.float16, copy=False).tolist()
+    max_hw_elems = 8
+    buffer_bytes = max_hw_elems * calc_dtype.itemsize
+    self.device.add_buffer(buffer_bytes)
+    self.input_buf = self.device.input_buf
+    self.weight_buf = self.device.weight_buf
+    self.output_buf = self.device.output_buf
+    dst_pad = np.empty(max_hw_elems, dtype=np.float16)
+    src_pad0 = np.zeros(max_hw_elems, dtype=np.float16)
+    src_pad1 = np.zeros(max_hw_elems, dtype=np.float16)
+    results = np.empty(elements, dtype=np.float16)
+    for offset in range(0, elements, max_hw_elems):
+      chunk = min(max_hw_elems, elements - offset)
+      src_slice0 = sources[0][offset:offset+chunk]
+      src_slice1 = sources[1][offset:offset+chunk]
+      src_pad0[:chunk] = src_slice0
+      src_pad1[:chunk] = src_slice1
+      if chunk < max_hw_elems:
+        src_pad0[chunk:] = 0
+        src_pad1[chunk:] = 0
+      ctypes.memmove(self.input_buf.va_addr, src_pad0.ctypes.data, buffer_bytes)
+      ctypes.memmove(self.weight_buf.va_addr, src_pad1.ctypes.data, buffer_bytes)
+      self.create_reg()
+      if chunk < max_hw_elems:
+        self.create_channel(max(chunk - 1, 0))
+        self.create_size(0, chunk)
+      self.ops(Ops.ADD, calc_dtype)
+      self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
+        self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
+      self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
+        self.reg(self.input_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
+      self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
+        self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
+      self.submit()
+      ctypes.memmove(dst_pad.ctypes.data, self.output_buf.va_addr, buffer_bytes)
+      results[offset:offset+chunk] = dst_pad[:chunk]
+    return results.astype(np.float16, copy=False).tolist()
 
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
