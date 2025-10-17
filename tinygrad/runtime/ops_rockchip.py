@@ -637,16 +637,12 @@ class RockchipProgram:
             handled = True
 
           if not handled:
-            if uop == Ops.ADD and dtype == dtypes.uint:
-              ul[i] = [exec_alu(uop, dtype, p) for p in zip(*inp)]
-            elif uop == Ops.MUL and dtype == dtypes.uint:
-              ul[i] = [exec_alu(uop, dtype, p) for p in zip(*inp)]
-            elif uop in (Ops.CMPEQ, Ops.CMPNE, Ops.XOR, Ops.AND, Ops.OR, Ops.TRUNC):
+            if uop in (Ops.CMPEQ, Ops.CMPNE, Ops.XOR, Ops.AND, Ops.OR, Ops.TRUNC):
               print('ALLOWED FALLBACK TO CPU', uop, dtype)
               ul[i] = [exec_alu(uop, dtype, p) for p in zip(*inp)]
             else:
-              print('FALLBACK TO CPU', uop, dtype)
-              ul[i] = [exec_alu(uop, dtype, p) for p in zip(*inp)]
+              print('FALLBACK TO CPU is not allowed', uop, dtype)
+
         assert i in ul, (uop, dtype, idp, arg)
         i += 1
     return time.perf_counter() - st
