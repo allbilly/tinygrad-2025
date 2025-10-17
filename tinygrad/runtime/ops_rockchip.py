@@ -5,6 +5,7 @@
 import array
 import ctypes
 import functools
+import math
 import mmap
 import os
 from typing import Any, TYPE_CHECKING
@@ -24,6 +25,62 @@ np.set_printoptions(threshold=sys.maxsize, linewidth=1000, suppress=False)
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+NPU_CBUF_BANK_SIZE = 32768
+NPU_CBUF_BANKS = 12
+MATMUL_CHANNEL_ALIGN = 32
+MATMUL_THREAD_CHUNK = 8
+PC_ENABLE = 0x01
+PC_ENABLE_CNA = 0x04
+PC_ENABLE_DPU = 0x08
+_MATMUL_LIB = None
+_MATMUL_GEN_FP16 = None
+
+
+class MatmulParams(ctypes.Structure):
+  _fields_ = [
+    ("m", ctypes.c_uint16),
+    ("k", ctypes.c_uint16),
+    ("n", ctypes.c_uint16),
+    ("_pad0", ctypes.c_uint16),
+    ("input_dma", ctypes.c_uint32),
+    ("weights_dma", ctypes.c_uint32),
+    ("output_dma", ctypes.c_uint32),
+    ("tasks", ctypes.POINTER(ctypes.c_uint64)),
+    ("fp32tofp16", ctypes.c_uint8),
+  ]
+
+
+def _align_up(value:int, align:int) -> int:
+  return (value + align - 1) // align * align
+
+def _weight_fp16_index(channels:int, kernel_idx:int, channel_idx:int) -> int:
+  k = kernel_idx + 1
+  c = channel_idx + 1
+  kpg = (k - 1) // 16
+  cpg = (c - 1) // 32
+  idx = ((cpg * 32) * 16) + (kpg * 16 * channels)
+  idx += ((c - 1) % 32) + (((k - 1) % 16) * 32)
+  return idx
+
+def _feature_fp16_index(channels:int, height:int, channel_idx:int, row_idx:int, chunk:int=MATMUL_THREAD_CHUNK) -> int:
+  c = channel_idx + 1
+  h = row_idx + 1
+  plane = (c - 1) // chunk
+  src = plane * height * chunk
+  offset = (c - 1) % chunk
+  return src + chunk * (h - 1) + offset
+
+def _load_matmul_lib():
+  global _MATMUL_LIB, _MATMUL_GEN_FP16
+  if _MATMUL_LIB is not None and _MATMUL_GEN_FP16 is not None:
+    return
+  lib_path = os.path.join(os.path.dirname(__file__), "..", "..", "npu", "include", "librk3588-npu.so")
+  if not os.path.exists(lib_path):
+    raise FileNotFoundError(f"missing Rockchip matmul helper at {lib_path}")
+  _MATMUL_LIB = ctypes.CDLL(lib_path)
+  _MATMUL_GEN_FP16 = _MATMUL_LIB.gen_matmul_fp16
+  _MATMUL_GEN_FP16.restype = ctypes.c_int
 
 
 def storage_fmt_for_dtype(dtype: DType):
@@ -461,7 +518,150 @@ class RockchipProgram:
     self.device = dev
     self.q = []
     self.code_for_op = RockchipRenderer.code_for_op
-    print('enter init')
+    self.name = name
+    self.matmul_bufs: dict[tuple[int,int,int], tuple[HCQBuffer, HCQBuffer, HCQBuffer]] = {}
+
+  def _maybe_run_matmul(self, bufs:tuple[Any, ...]) -> bool:
+    name = getattr(self, "name", "")
+    if not name.startswith("r_"):
+      return False
+    parts = name.split('_')
+    if len(parts) < 4 or not all(part.isdigit() for part in parts[1:4]):
+      return False
+    if len(bufs) < 3:
+      return False
+    M, K, N = (int(parts[1]), int(parts[2]), int(parts[3]))
+    try:
+      self._run_matmul_conv(bufs, M, K, N)
+      if getenv("DEBUG"):
+        print("matmul handled", name, M, K, N)
+      return True
+    except Exception as exc:
+      if getenv("DEBUG"):
+        print("matmul conv fallback", exc)
+      return False
+
+  def _run_matmul_conv(self, bufs:tuple[Any, ...], M:int, K:int, N:int) -> None:
+    try:
+      out_buf, a_buf, b_buf = bufs[:3]
+      a = np.frombuffer(a_buf, dtype=np.float16, count=M*K).reshape(M, K)
+      b = np.frombuffer(b_buf, dtype=np.float16, count=K*N).reshape(K, N)
+    except Exception as exc:
+      if getenv("DEBUG"):
+        print("matmul buffer prep failed", exc)
+      raise
+
+    Mpad = max(_align_up(M, MATMUL_CHANNEL_ALIGN), MATMUL_CHANNEL_ALIGN)
+    Kpad = max(_align_up(K, MATMUL_CHANNEL_ALIGN), MATMUL_CHANNEL_ALIGN)
+    Npad = max(_align_up(N, MATMUL_CHANNEL_ALIGN), MATMUL_CHANNEL_ALIGN)
+
+    feature_arr = np.zeros((Mpad * Kpad,), dtype=np.float16)
+    for m in range(M):
+      for k in range(K):
+        idx = _feature_fp16_index(Kpad, Mpad, k, m)
+        feature_arr[idx] = a[m, k]
+
+    weight_arr = np.zeros((Npad * Kpad,), dtype=np.float16)
+    for n in range(N):
+      for k in range(K):
+        idx = _weight_fp16_index(Kpad, n, k)
+        weight_arr[idx] = b[k, n]
+
+    key = (Mpad, Kpad, Npad)
+    if key not in self.matmul_bufs:
+      input_buf = self.device._gpu_alloc(feature_arr.nbytes, 0)
+      weight_buf = self.device._gpu_alloc(weight_arr.nbytes, 0)
+      output_buf = self.device._gpu_alloc(Mpad * Npad * ctypes.sizeof(ctypes.c_float), 0)
+      self.matmul_bufs[key] = (input_buf, weight_buf, output_buf)
+    else:
+      input_buf, weight_buf, output_buf = self.matmul_bufs[key]
+
+    feats_bytes = feature_arr.tobytes()
+    w_bytes = weight_arr.tobytes()
+    ctypes.memmove(input_buf.va_addr, feats_bytes, len(feats_bytes))
+    ctypes.memmove(weight_buf.va_addr, w_bytes, len(w_bytes))
+    if getenv("DEBUG"):
+      print("matmul dma", hex(input_buf.meta.dma_addr), hex(weight_buf.meta.dma_addr), hex(output_buf.meta.dma_addr))
+
+    q_vals = self._build_matmul_queue(Mpad, Kpad, Npad,
+      input_buf.meta.dma_addr, weight_buf.meta.dma_addr, output_buf.meta.dma_addr)
+    self._submit_queue(q_vals, op_idx=0, enable_mask=0xd)
+
+    out_bytes = ctypes.create_string_buffer(Mpad * Npad * ctypes.sizeof(ctypes.c_float))
+    ctypes.memmove(out_bytes, output_buf.va_addr, out_bytes._length_)
+    out_mat = np.frombuffer(out_bytes, dtype=np.float32)
+    if getenv("DEBUG"):
+      print("raw matmul nonzero rows", np.nonzero(out_mat)[0][:16])
+    trimmed = out_mat[:M * N].astype(np.float16)
+    out_bytes = trimmed.tobytes()
+    if isinstance(out_buf, HCQBuffer):
+      ctypes.memmove(out_buf.va_addr, out_bytes, len(out_bytes))
+    else:
+      mv = out_buf if isinstance(out_buf, memoryview) else memoryview(out_buf)
+      mv[:len(out_bytes)] = out_bytes
+
+  def _build_matmul_queue(self, Mpad:int, Kpad:int, Npad:int,
+                          input_dma:int, weight_dma:int, output_dma:int) -> list[int]:
+    if not (Mpad == MATMUL_CHANNEL_ALIGN and Kpad == MATMUL_CHANNEL_ALIGN and Npad == MATMUL_CHANNEL_ALIGN):
+      raise RuntimeError("unsupported matmul configuration for Rockchip template")
+
+    _load_matmul_lib()
+    tasks_arr = (ctypes.c_uint64 * 112)()
+    params = MatmulParams()
+    params.m = Mpad
+    params.k = Kpad
+    params.n = Npad
+    params.input_dma = input_dma & 0xffffffff
+    params.weights_dma = weight_dma & 0xffffffff
+    params.output_dma = output_dma & 0xffffffff
+    params.tasks = ctypes.cast(tasks_arr, ctypes.POINTER(ctypes.c_uint64))
+    params.fp32tofp16 = 0
+    try:
+      if getenv("DEBUG"):
+        print("matmul gen fn", _MATMUL_GEN_FP16)
+      ret = _MATMUL_GEN_FP16(ctypes.byref(params))
+    except TypeError as exc:
+      if getenv("DEBUG"):
+        print("matmul gen call failed", exc, repr(ctypes.byref(params)))
+      raise
+    if ret != 0:
+      raise RuntimeError(f"gen_matmul_fp16 returned {ret}")
+    return [tasks_arr[i] for i in range(112)]
+
+  def _submit_queue(self, q_vals:list[int], op_idx:int, enable_mask:int):
+    tasks = ctypes.cast(self.device.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task * 128)).contents
+    regcmd = ctypes.cast(self.device.cmd_buf.va_addr, ctypes.POINTER(ctypes.c_uint64 * 128)).contents
+    for idx, val in enumerate(q_vals):
+      regcmd[idx] = val
+    tasks[0].flags = 0
+    tasks[0].op_idx = op_idx
+    tasks[0].enable_mask = enable_mask
+    tasks[0].int_mask = 0x300
+    tasks[0].int_clear = 0x1ffff
+    tasks[0].int_status = 0
+    tasks[0].regcfg_amount = max(len(q_vals) - (rk.RKNPU_PC_DATA_EXTRA_AMOUNT + 4), 0)
+    tasks[0].regcfg_offset = 0
+    tasks[0].regcmd_addr = self.device.cmd_buf.meta.dma_addr
+    submit_res = rk.struct_rknpu_submit(
+      flags=rk.RKNPU_JOB_PC | rk.RKNPU_JOB_BLOCK | rk.RKNPU_JOB_PINGPONG,
+      timeout=6000,
+      task_start=0,
+      task_number=1,
+      task_counter=0,
+      priority=0,
+      task_obj_addr=self.device.task_buf.meta.obj_addr,
+      regcfg_obj_addr=0,
+      task_base_addr=0,
+      user_data=0,
+      core_mask=1,
+      fence_fd=-1,
+      subcore_task=(rk.struct_rknpu_subcore_task * 5)(
+        rk.struct_rknpu_subcore_task(task_start=0, task_number=1),
+        rk.struct_rknpu_subcore_task(task_start=1, task_number=0),
+        rk.struct_rknpu_subcore_task(task_start=2, task_number=0),
+      )
+    )
+    rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl, __payload=submit_res)
 
   def _buffer_nbytes(self, buf) -> int:
     if isinstance(buf, HCQBuffer): return buf.size
@@ -491,8 +691,12 @@ class RockchipProgram:
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
     st = time.perf_counter()
+    if self._maybe_run_matmul(bufs):
+      return time.perf_counter() - st
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)
+    if "matmul" in getattr(self, "name", ""):
+      print("matmul kernel name:", self.name)
     define_indices = [idx for idx, uop in enumerate(self.uops) if uop[0] is Ops.DEFINE_GLOBAL]
     global_bufs = {idx: bufs[pos] for pos, idx in enumerate(define_indices)}
     for idxs in itertools.product(*[range(x) for x in global_size[::-1]]):
@@ -637,7 +841,7 @@ class RockchipProgram:
             handled = True
 
           if not handled:
-            if uop in (Ops.CMPEQ, Ops.CMPNE, Ops.XOR, Ops.AND, Ops.OR, Ops.TRUNC):
+            if uop in (Ops.CMPLT, Ops.CMPEQ, Ops.CMPNE, Ops.XOR, Ops.AND, Ops.OR, Ops.TRUNC):
               print('ALLOWED FALLBACK TO CPU', uop, dtype)
               ul[i] = [exec_alu(uop, dtype, p) for p in zip(*inp)]
             else:
