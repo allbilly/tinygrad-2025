@@ -190,32 +190,36 @@ class RockchipProgram:
     return dtype == dtypes.float16 or dtype == dtypes.float
 
   def ops(self, op, dtype):
-    # print(op, dtype, self.get_precision(dtype), op==Ops.ADD)
+    is_float_add = (op == Ops.ADD and dtype == dtypes.float)
+    in_dtype = dtypes.float16 if is_float_add else dtype
+    proc_dtype = dtypes.float16 if is_float_add else dtype
+    out_dtype = dtypes.float32 if is_float_add else dtype
+    ew_op_cvt_bypass = 1 if is_float_add else 0
 
     self.emit_raw(rk.DPU, rk.REG_DPU_DATA_FORMAT,
-      # self.reg(self.get_precision(dtype, fp32out=op==Ops.ADD), rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
-      self.reg(self.get_precision(dtype), rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
-      self.reg(self.get_precision(dtype), rk.DPU_DATA_FORMAT_IN_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_IN_PRECISION__MASK) |
-      self.reg(self.get_precision(dtype), rk.DPU_DATA_FORMAT_PROC_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_PROC_PRECISION__MASK))
+      self.reg(self.get_precision(out_dtype), rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
+      self.reg(self.get_precision(in_dtype), rk.DPU_DATA_FORMAT_IN_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_IN_PRECISION__MASK) |
+      self.reg(self.get_precision(proc_dtype), rk.DPU_DATA_FORMAT_PROC_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_PROC_PRECISION__MASK))
 
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_FEATURE_MODE_CFG,
-      self.reg(self.get_precision(dtype), rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_IN_PRECISION__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_IN_PRECISION__MASK) |
+      self.reg(self.get_precision(in_dtype), rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_IN_PRECISION__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_IN_PRECISION__MASK) |
       self.reg(15, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_BURST_LEN__MASK) |
       self.reg(0, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_COMB_USE__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_COMB_USE__MASK) |
-      self.reg(self.get_precision(dtype), rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_PROC_PRECISION__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_PROC_PRECISION__MASK) |
+      self.reg(self.get_precision(proc_dtype), rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_PROC_PRECISION__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_PROC_PRECISION__MASK) |
       self.reg(0, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_DISABLE__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_DISABLE__MASK) |
-      self.reg(self.get_is_fp16(dtype), rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN__MASK) |
+      self.reg(self.get_is_fp16(in_dtype), rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_MRDMA_FP16TOFP32_EN__MASK) |
       self.reg(0, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_CONV_MODE__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_CONV_MODE__MASK) |
       self.reg(1, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE__SHIFT, rk.DPU_RDMA_RDMA_FEATURE_MODE_CFG_FLYING_MODE__MASK))
 
+    fp32_to_fp16_en = 1 if out_dtype == dtypes.float16 else 0
+    out_cvt_scale = 0 if out_dtype == dtypes.float32 else 1
     self.emit_raw(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE, 
-      self.reg(self.get_is_fp16(dtype), rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__SHIFT, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__MASK) |
-      # self.reg(0, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__SHIFT, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__MASK) |
-      self.reg(1, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK));
+      self.reg(fp32_to_fp16_en, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__SHIFT, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__MASK) |
+      self.reg(out_cvt_scale, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK));
 
     self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_ERDMA_CFG,
       self.reg(1, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_MODE__MASK) |
-      self.reg(self.get_edata_size(dtype), rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__MASK))
+      self.reg(self.get_edata_size(in_dtype), rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__SHIFT, rk.DPU_RDMA_RDMA_ERDMA_CFG_ERDMA_DATA_SIZE__MASK))
     
     self.emit_raw(rk.DPU, rk.REG_DPU_BS_CFG,
       self.reg(0, rk.DPU_BS_CFG_BS_ALU_ALGO__SHIFT, rk.DPU_BS_CFG_BS_ALU_ALGO__MASK) |
@@ -238,7 +242,7 @@ class RockchipProgram:
         self.reg(0, rk.DPU_EW_CFG_EW_CVT_TYPE__SHIFT, rk.DPU_EW_CFG_EW_CVT_TYPE__MASK) |
         self.reg(0, rk.DPU_EW_CFG_EW_CVT_ROUND__SHIFT, rk.DPU_EW_CFG_EW_CVT_ROUND__MASK) |
         self.reg(1, rk.DPU_EW_CFG_EW_DATA_MODE__SHIFT, rk.DPU_EW_CFG_EW_DATA_MODE__MASK) |
-        self.reg(self.get_edata_size(dtype), rk.DPU_EW_CFG_EDATA_SIZE__SHIFT, rk.DPU_EW_CFG_EDATA_SIZE__MASK) |
+        self.reg(self.get_edata_size(in_dtype), rk.DPU_EW_CFG_EDATA_SIZE__SHIFT, rk.DPU_EW_CFG_EDATA_SIZE__MASK) |
         self.reg(0, rk.DPU_EW_CFG_EW_EQUAL_EN__SHIFT, rk.DPU_EW_CFG_EW_EQUAL_EN__MASK) |
         self.reg(0, rk.DPU_EW_CFG_EW_BINARY_EN__SHIFT, rk.DPU_EW_CFG_EW_BINARY_EN__MASK) |
         self.reg(0, rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT, rk.DPU_EW_CFG_EW_ALU_ALGO__MASK) |
@@ -256,13 +260,13 @@ class RockchipProgram:
         self.reg(0, rk.DPU_EW_CFG_EW_CVT_TYPE__SHIFT, rk.DPU_EW_CFG_EW_CVT_TYPE__MASK) |
         self.reg(0, rk.DPU_EW_CFG_EW_CVT_ROUND__SHIFT, rk.DPU_EW_CFG_EW_CVT_ROUND__MASK) |
         self.reg(1, rk.DPU_EW_CFG_EW_DATA_MODE__SHIFT, rk.DPU_EW_CFG_EW_DATA_MODE__MASK) |
-        self.reg(self.get_edata_size(dtype), rk.DPU_EW_CFG_EDATA_SIZE__SHIFT, rk.DPU_EW_CFG_EDATA_SIZE__MASK) |
+        self.reg(self.get_edata_size(in_dtype), rk.DPU_EW_CFG_EDATA_SIZE__SHIFT, rk.DPU_EW_CFG_EDATA_SIZE__MASK) |
         self.reg(0, rk.DPU_EW_CFG_EW_EQUAL_EN__SHIFT, rk.DPU_EW_CFG_EW_EQUAL_EN__MASK) |
         self.reg(0, rk.DPU_EW_CFG_EW_BINARY_EN__SHIFT, rk.DPU_EW_CFG_EW_BINARY_EN__MASK) |
         self.reg(self.code_for_op[op], rk.DPU_EW_CFG_EW_ALU_ALGO__SHIFT, rk.DPU_EW_CFG_EW_ALU_ALGO__MASK) |
         self.reg(0, rk.DPU_EW_CFG_EW_RELUX_EN__SHIFT, rk.DPU_EW_CFG_EW_RELUX_EN__MASK) |
         self.reg(1, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
-        self.reg(0, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
+        self.reg(ew_op_cvt_bypass, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
         self.reg(1, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
         self.reg(1, rk.DPU_EW_CFG_EW_OP_SRC__SHIFT, rk.DPU_EW_CFG_EW_OP_SRC__MASK) |
         self.reg(0, rk.DPU_EW_CFG_EW_MUL_PRELU__SHIFT, rk.DPU_EW_CFG_EW_MUL_PRELU__MASK) |
@@ -457,9 +461,6 @@ class RockchipProgram:
     self.device = dev
     self.q = []
     self.code_for_op = RockchipRenderer.code_for_op
-    self._alu_cache: dict[int, list[float]] = {}
-    self._alu_offsets: dict[int, int] = {}
-    self._fp16_add_plan: dict[str, Any]|None = None
     print('enter init')
 
   def _buffer_nbytes(self, buf) -> int:
@@ -488,134 +489,12 @@ class RockchipProgram:
       return None
     return None
 
-  def _plan_fp16_add(self, global_bufs:dict[int, Any]) -> dict[str, Any]|None:
-    add_idxs: list[int] = []
-    add_dtype = None
-    add_srcs: list[int] = []
-    store_idx: int|None = None
-    value_idx: int|None = None
-    for idx, (op, _, srcs, _) in enumerate(self.uops):
-      if op is not Ops.STORE or len(srcs) < 2: continue
-      data_idx = srcs[1]
-      data_op, data_dtype, data_srcs, _ = self.uops[data_idx]
-      candidate_adds = []
-      if data_op is Ops.VECTORIZE:
-        candidate_adds = data_srcs
-      elif data_op is Ops.ADD:
-        candidate_adds = [data_idx]
-      if not candidate_adds: continue
-      valid = True
-      for add_idx in candidate_adds:
-        op_add, dtype_add, srcs_add, _ = self.uops[add_idx]
-        if op_add is not Ops.ADD or dtype_add not in (dtypes.float, dtypes.float16):
-          valid = False
-          break
-      if not valid: continue
-      add_idxs = candidate_adds
-      add_dtype = self.uops[candidate_adds[0]][1]
-      add_srcs = self.uops[candidate_adds[0]][2]
-      store_idx = idx
-      value_idx = data_idx
-      break
-    if store_idx is None or value_idx is None or not add_idxs: return None
-    store_srcs = self.uops[store_idx][2]
-    if len(store_srcs) < 2: return None
-    dst_define = self._trace_define_global(store_srcs[0])
-    if dst_define is None or dst_define not in global_bufs: return None
-    src_defines: list[int] = []
-    for src_idx in add_srcs:
-      traced = self._trace_define_global(src_idx)
-      if traced is None or traced not in global_bufs: return None
-      src_defines.append(traced)
-    dst_dtype = self.uops[dst_define][1]
-    if not isinstance(dst_dtype, PtrDType) or dst_dtype.size <= 0: return None
-    src_dtypes = []
-    for define_idx in src_defines:
-      define_dtype = self.uops[define_idx][1]
-      if not isinstance(define_dtype, PtrDType): return None
-      src_dtypes.append(define_dtype.base)
-    dst_bytes_expected = dst_dtype.size * dst_dtype.base.itemsize
-    if self._buffer_nbytes(global_bufs[dst_define]) < dst_bytes_expected: return None
-    primary_idx = add_idxs[0]
-    return {
-      "add_idx": primary_idx,
-      "add_indices": tuple(add_idxs),
-      "add_dtype": add_dtype,
-      "store_idx": store_idx,
-      "dst_define": dst_define,
-      "src_defines": tuple(src_defines),
-      "dst_dtype": dst_dtype,
-      "src_dtypes": tuple(src_dtypes),
-      "elements": dst_dtype.size,
-    }
-
-  def _execute_fp16_add(self, global_bufs:dict[int, Any], uop_idx:int, dtype:DType) -> list[float]:
-    plan = self._fp16_add_plan
-    indices = ()
-    if plan is not None:
-      indices = plan.get("add_indices", (plan.get("add_idx"),))
-    if plan is None or uop_idx not in indices:
-      plan = self._plan_fp16_add(global_bufs)
-      if plan is None: return []
-      indices = plan.get("add_indices", (plan.get("add_idx"),))
-      if uop_idx not in indices: return []
-    elements:int = plan["elements"]
-    if elements <= 0: return []
-    calc_dtype = dtypes.float16
-    sources = []
-    for define_idx, src_dtype in zip(plan["src_defines"], plan["src_dtypes"]):
-      src_bytes = self._buffer_as_bytes(global_bufs[define_idx], elements * src_dtype.itemsize)
-      np_dtype = np.float32 if src_dtype == dtypes.float else np.float16
-      src_arr = np.frombuffer(src_bytes, dtype=np_dtype, count=elements)
-      sources.append(src_arr.astype(np.float16, copy=False))
-    max_hw_elems = 8
-    buffer_bytes = max_hw_elems * calc_dtype.itemsize
-    self.device.add_buffer(buffer_bytes)
-    self.input_buf = self.device.input_buf
-    self.weight_buf = self.device.weight_buf
-    self.output_buf = self.device.output_buf
-    dst_pad = np.empty(max_hw_elems, dtype=np.float16)
-    src_pad0 = np.zeros(max_hw_elems, dtype=np.float16)
-    src_pad1 = np.zeros(max_hw_elems, dtype=np.float16)
-    results = np.empty(elements, dtype=np.float16)
-    for offset in range(0, elements, max_hw_elems):
-      chunk = min(max_hw_elems, elements - offset)
-      src_slice0 = sources[0][offset:offset+chunk]
-      src_slice1 = sources[1][offset:offset+chunk]
-      src_pad0[:chunk] = src_slice0
-      src_pad1[:chunk] = src_slice1
-      if chunk < max_hw_elems:
-        src_pad0[chunk:] = 0
-        src_pad1[chunk:] = 0
-      ctypes.memmove(self.input_buf.va_addr, src_pad0.ctypes.data, buffer_bytes)
-      ctypes.memmove(self.weight_buf.va_addr, src_pad1.ctypes.data, buffer_bytes)
-      self.create_reg()
-      if chunk < max_hw_elems:
-        self.create_channel(max(chunk - 1, 0))
-        self.create_size(0, chunk)
-      self.ops(Ops.ADD, calc_dtype)
-      self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
-        self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
-      self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
-        self.reg(self.input_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
-      self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
-        self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
-      self.submit()
-      ctypes.memmove(dst_pad.ctypes.data, self.output_buf.va_addr, buffer_bytes)
-      results[offset:offset+chunk] = dst_pad[:chunk]
-    return results.astype(np.float16, copy=False).tolist()
-
-
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
     st = time.perf_counter()
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)
-    self._alu_cache.clear()
-    self._alu_offsets.clear()
     define_indices = [idx for idx, uop in enumerate(self.uops) if uop[0] is Ops.DEFINE_GLOBAL]
     global_bufs = {idx: bufs[pos] for pos, idx in enumerate(define_indices)}
-    fp16_add_plan = self._plan_fp16_add(global_bufs)
-    self._fp16_add_plan = fp16_add_plan
     for idxs in itertools.product(*[range(x) for x in global_size[::-1]]):
       ul: dict[int, Any] = {}
       dl: dict[int, DType] = {}
@@ -702,31 +581,7 @@ class RockchipProgram:
           assert all_same([dtype] + dtp) or uop in {Ops.CMPNE, Ops.CMPLT, Ops.WHERE}, f"dtype mismatch on {uop}"
           handled = False
 
-          if fp16_add_plan is not None:
-            add_indices = fp16_add_plan.get("add_indices", (fp16_add_plan["add_idx"],))
-            plan_key = add_indices[0]
-          else:
-            add_indices = ()
-            plan_key = None
-
-          if (fp16_add_plan is not None and i in add_indices and len(inp) == 2 and
-              dtype in (dtypes.float, dtypes.float16)):
-            cache = self._alu_cache.get(plan_key)
-            if cache is None:
-              cache = self._execute_fp16_add(global_bufs, plan_key, dtype)
-              self._alu_cache[plan_key] = cache
-              self._alu_offsets[plan_key] = 0
-            chunk = len(inp[0])
-            start_off = self._alu_offsets[plan_key]
-            end_off = start_off + chunk
-            ul[i] = cache[start_off:end_off]
-            self._alu_offsets[plan_key] = end_off
-            if self._alu_offsets[plan_key] >= len(cache):
-              self._alu_cache.pop(plan_key, None)
-              self._alu_offsets.pop(plan_key, None)
-            handled = True
-
-          if not handled and (len(inp) == 2 
+          if (len(inp) == 2 
             and (dtype in (dtypes.int8, dtypes.int16, dtypes.int32, dtypes.int, dtypes.float, dtypes.float16))
             and (uop in RockchipRenderer.code_for_op.keys())):
 
@@ -748,7 +603,7 @@ class RockchipProgram:
               dst = np.frombuffer((bytearray(self.output_buf.size * dtypes.float16.itemsize)), dtype=np.float16)
               
               self.ops(uop, dtypes.float16)
-   
+  
             elif dtype == dtypes.int32 or dtype == dtypes.int16:
               src = memoryview(bytearray(np.int16(inp[0]).tobytes()))
               ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
@@ -774,6 +629,8 @@ class RockchipProgram:
             self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
               self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
           
+            if getenv("ROCKTRACE"):
+              print("rock_add_seq_default", [hex(int(v)) for v in self.q])
             self.submit()
             ctypes.memmove(dst.ctypes.data, self.output_buf.va_addr, self.output_buf.size * dtype.itemsize)
             ul[i] = dst.tolist()
@@ -792,7 +649,6 @@ class RockchipProgram:
               ul[i] = [exec_alu(uop, dtype, p) for p in zip(*inp)]
         assert i in ul, (uop, dtype, idp, arg)
         i += 1
-    self._fp16_add_plan = None
     return time.perf_counter() - st
 
 class RockchipRegisterAllocator(HCQAllocatorBase):
