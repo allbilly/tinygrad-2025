@@ -33,8 +33,26 @@ MATMUL_THREAD_CHUNK = 8
 PC_ENABLE = 0x01
 PC_ENABLE_CNA = 0x04
 PC_ENABLE_DPU = 0x08
-_MATMUL_LIB = None
-_MATMUL_GEN_FP16 = None
+BLOCK_PC = 0x0100
+BLOCK_CNA = 0x0200
+BLOCK_CORE = 0x0800
+BLOCK_DPU = 0x1000
+PC_OP_01 = 0x01
+PC_OP_40 = 0x40
+PC_OP_ENABLE = 0x80
+OP_REG_PC = BLOCK_PC | PC_OP_01
+OP_REG_CNA = BLOCK_CNA | PC_OP_01
+OP_REG_CORE = BLOCK_CORE | PC_OP_01
+OP_REG_DPU = BLOCK_DPU | PC_OP_01
+OP_40 = PC_OP_40 | PC_OP_01
+OP_ENABLE = PC_OP_ENABLE | PC_OP_01
+OP_NONE = 0x0
+DIRECT_CONVOLUTION = 0
+PRECISION_INT8 = 0
+PRECISION_FLOAT16 = 2
+PRECISION_FLOAT32 = 5
+REG_CORE_3030 = 0x00003030
+REG_DPU_40C4 = 0x000040C4
 
 
 class MatmulParams(ctypes.Structure):
@@ -71,16 +89,265 @@ def _feature_fp16_index(channels:int, height:int, channel_idx:int, row_idx:int, 
   offset = (c - 1) % chunk
   return src + chunk * (h - 1) + offset
 
-def _load_matmul_lib():
-  global _MATMUL_LIB, _MATMUL_GEN_FP16
-  if _MATMUL_LIB is not None and _MATMUL_GEN_FP16 is not None:
-    return
-  lib_path = os.path.join(os.path.dirname(__file__), "..", "..", "npu", "include", "librk3588-npu.so")
-  if not os.path.exists(lib_path):
-    raise FileNotFoundError(f"missing Rockchip matmul helper at {lib_path}")
-  _MATMUL_LIB = ctypes.CDLL(lib_path)
-  _MATMUL_GEN_FP16 = _MATMUL_LIB.gen_matmul_fp16
-  _MATMUL_GEN_FP16.restype = ctypes.c_int
+def _npuop(op:int, value:int, reg:int) -> int:
+  return ((op & 0xffff) << 48) | ((value & 0xffffffff) << 16) | (reg & 0xffff)
+
+def _gen_matmul_fp16(params:MatmulParams) -> int:
+  m = int(params.m)
+  k = int(params.k)
+  n = int(params.n)
+  input_dma = int(params.input_dma)
+  weights_dma = int(params.weights_dma)
+  output_dma = int(params.output_dma)
+  fp32tofp16 = int(params.fp32tofp16 & 0x1)
+
+  datain_width = 1
+  datain_height = m
+  datain_channel = k
+  dataout_width = 1
+  dataout_height = m
+  weight_width = 1
+  weight_height = 1
+  weight_kernels = n
+
+  weight_bytes_per_kernel = weight_width * weight_height * datain_channel * ctypes.sizeof(ctypes.c_uint16)
+  weight_bytes = weight_bytes_per_kernel * weight_kernels
+  fd_bytes = datain_width * datain_height * datain_channel * ctypes.sizeof(ctypes.c_uint16)
+
+  fd_banks = (fd_bytes + NPU_CBUF_BANK_SIZE - 1) // NPU_CBUF_BANK_SIZE
+  weight_banks = (weight_bytes + NPU_CBUF_BANK_SIZE - 1) // NPU_CBUF_BANK_SIZE
+  if fd_banks > NPU_CBUF_BANKS - 1:
+    return -1
+  if weight_bytes_per_kernel <= NPU_CBUF_BANK_SIZE:
+    weight_banks = NPU_CBUF_BANKS - fd_banks
+  else:
+    return -2
+
+  data_entries = (datain_width * datain_channel + 31) // 32
+  line_stride = datain_width * 4
+  surf_stride = line_stride * ((datain_height // 4) - 1)
+  if surf_stride < 0:
+    surf_stride += 1
+
+  cna = {
+    "proc_precision": PRECISION_FLOAT16,
+    "in_precision": PRECISION_FLOAT16,
+    "conv_mode": DIRECT_CONVOLUTION,
+    "kernel_groups": 0,
+    "feature_grains": m + 1,
+    "conv_x_stride": 1,
+    "conv_y_stride": 1,
+    "datain_width": datain_width,
+    "datain_height": datain_height,
+    "datain_channel": datain_channel,
+    "dataout_width": dataout_width,
+    "dataout_height": dataout_height,
+    "dataout_atomics": dataout_width * dataout_height,
+    "weight_width": weight_width,
+    "weight_height": weight_height,
+    "weight_kernels": weight_kernels,
+    "weight_bytes_per_kernel": weight_bytes_per_kernel,
+    "weight_bytes": weight_bytes,
+    "weight_bank": weight_banks,
+    "data_bank": fd_banks,
+    "data_entries": data_entries,
+    "data_sign": 0x1,
+    "cvt_type": 0x1,
+    "cvt_bypass": 0x1,
+    "cvt_scale0": 0x1,
+    "cvt_scale1": 0x1,
+    "cvt_scale2": 0x1,
+    "cvt_scale3": 0x1,
+    "fc_skip_en": 0,
+    "data_offset": 0,
+    "pad_left": 0,
+    "pad_top": 0,
+    "feature_base_addr": input_dma,
+    "weight_offset": 0,
+    "weight_burst_len": 0xf,
+    "data_burst_len": 0xf,
+    "line_stride": line_stride,
+    "surf_stride": surf_stride,
+    "dma_width": datain_width,
+    "dma_height": datain_height,
+    "dma_channel": datain_channel,
+    "decompress_addr0": weights_dma,
+  }
+
+  core = {
+    "proc_precision": PRECISION_FLOAT16,
+    "qd_en": 1,
+    "dataout_height": max(dataout_height - 1, 0),
+    "dataout_width": max(dataout_width - 1, 0),
+    "dataout_channel": max(weight_kernels - 1, 0),
+  }
+
+  dst_surf_stride = dataout_height * dataout_width
+  convert_out = PRECISION_FLOAT16 if fp32tofp16 else PRECISION_FLOAT32
+  size_e_val = 1 if fp32tofp16 else 3
+  surf_add_scale = 2 if fp32tofp16 else 4
+
+  dpu = {
+    "burst_len": 0xf,
+    "conv_mode": DIRECT_CONVOLUTION,
+    "output_mode": 0x2,
+    "flying_mode": 0x0,
+    "out_precision": convert_out,
+    "in_precision": PRECISION_FLOAT16,
+    "proc_precision": PRECISION_FLOAT16,
+    "dst_base_addr": output_dma,
+    "dst_surf_stride": dst_surf_stride,
+    "width": core["dataout_width"],
+    "height": core["dataout_height"],
+    "channel": core["dataout_channel"],
+    "bs_bypass": 1,
+    "bs_alu_bypass": 1,
+    "bs_mul_bypass": 1,
+    "bs_relu_bypass": 1,
+    "bn_bypass": 1,
+    "bn_alu_bypass": 1,
+    "bn_mul_bypass": 1,
+    "bn_relu_bypass": 1,
+    "ew_bypass": 1,
+    "ew_op_bypass": 1,
+    "ew_lut_bypass": 1,
+    "ew_op_cvt_bypass": 1,
+    "ew_relu_bypass": 1,
+    "fp32tofp16_en": fp32tofp16,
+    "out_cvt_scale": 1,
+    "size_e_2": size_e_val,
+    "size_e_1": size_e_val,
+    "size_e_0": size_e_val,
+    "od_bypass": 1,
+    "width_wdma": core["dataout_width"],
+    "height_wdma": core["dataout_height"],
+    "channel_wdma": core["dataout_channel"],
+    "surf_add": dst_surf_stride * surf_add_scale,
+  }
+
+  tasks = params.tasks
+  if not tasks:
+    return -3
+
+  ops:list[int] = []
+  ops.append(_npuop(OP_REG_DPU, 0xE, rk.REG_DPU_S_POINTER))
+  value = ((cna["proc_precision"] & 0x7) << 7) | ((cna["in_precision"] & 0x7) << 4) | (cna["conv_mode"] & 0xf)
+  ops.append(_npuop(OP_REG_CNA, value, rk.REG_CNA_CONV_CON1))
+  value = ((cna["kernel_groups"] & 0xFF) << 16) | ((cna["feature_grains"] & 0x3FF) << 4)
+  ops.append(_npuop(OP_REG_CNA, value, rk.REG_CNA_CONV_CON2))
+  value = ((cna["conv_y_stride"] & 0x7) << 3) | (cna["conv_x_stride"] & 0x7)
+  ops.append(_npuop(OP_REG_CNA, value, rk.REG_CNA_CONV_CON3))
+  value = ((cna["datain_width"] & 0x7FF) << 16) | (cna["datain_height"] & 0x7FF)
+  ops.append(_npuop(OP_REG_CNA, value, rk.REG_CNA_DATA_SIZE0))
+  value = (((cna["datain_channel"] - 1) & 0xFFFF) << 16) | (cna["datain_channel"] & 0xFFFF)
+  ops.append(_npuop(OP_REG_CNA, value, rk.REG_CNA_DATA_SIZE1))
+  value = cna["dataout_width"] & 0x7FF
+  ops.append(_npuop(OP_REG_CNA, value, rk.REG_CNA_DATA_SIZE2))
+  value = cna["dataout_atomics"] & 0x3FFFF
+  ops.append(_npuop(OP_REG_CNA, value, rk.REG_CNA_DATA_SIZE3))
+  ops.append(_npuop(OP_REG_CNA, cna["weight_bytes"], rk.REG_CNA_WEIGHT_SIZE0))
+  value = cna["weight_bytes_per_kernel"] & 0x7FFFF
+  ops.append(_npuop(OP_REG_CNA, value, rk.REG_CNA_WEIGHT_SIZE1))
+  value = ((cna["weight_width"] & 0x1F) << 24) | ((cna["weight_height"] & 0x1F) << 16) | (cna["weight_kernels"] & 0x3FFF)
+  ops.append(_npuop(OP_REG_CNA, value, rk.REG_CNA_WEIGHT_SIZE2))
+  value = ((cna["weight_bank"] & 0xF) << 4) | (cna["data_bank"] & 0xF)
+  ops.append(_npuop(OP_REG_CNA, value, rk.REG_CNA_CBUF_CON0))
+  ops.append(_npuop(OP_REG_CNA, cna["data_entries"] & 0x1FFF, rk.REG_CNA_CBUF_CON1))
+  value = ((cna["data_sign"] & 0x1) << 3) | ((cna["cvt_type"] & 0x1) << 1) | (cna["cvt_bypass"] & 0x1)
+  ops.append(_npuop(OP_REG_CNA, value, rk.REG_CNA_CVT_CON0))
+  ops.append(_npuop(OP_REG_CNA, (cna["cvt_scale0"] & 0xFFFF) << 16, rk.REG_CNA_CVT_CON1))
+  ops.append(_npuop(OP_REG_CNA, (cna["cvt_scale1"] & 0xFFFF) << 16, rk.REG_CNA_CVT_CON2))
+  ops.append(_npuop(OP_REG_CNA, (cna["cvt_scale2"] & 0xFFFF) << 16, rk.REG_CNA_CVT_CON3))
+  ops.append(_npuop(OP_REG_CNA, (cna["cvt_scale3"] & 0xFFFF) << 16, rk.REG_CNA_CVT_CON4))
+  ops.append(_npuop(OP_REG_CNA, cna["fc_skip_en"] & 0x1, rk.REG_CNA_FC_CON0))
+  ops.append(_npuop(OP_REG_CNA, cna["data_offset"] & 0x1FFFF, rk.REG_CNA_FC_CON1))
+  value = ((cna["pad_left"] & 0xF) << 4) | (cna["pad_top"] & 0xF)
+  ops.append(_npuop(OP_REG_CNA, value, rk.REG_CNA_PAD_CON0))
+  ops.append(_npuop(OP_REG_CNA, cna["feature_base_addr"], rk.REG_CNA_FEATURE_DATA_ADDR))
+  ops.append(_npuop(OP_REG_CNA, cna["weight_offset"] & 0x1FFFF, rk.REG_CNA_FC_CON2))
+  value = ((cna["weight_burst_len"] & 0xF) << 16) | (cna["data_burst_len"] & 0xF)
+  ops.append(_npuop(OP_REG_CNA, value, rk.REG_CNA_DMA_CON0))
+  ops.append(_npuop(OP_REG_CNA, cna["line_stride"] & 0xFFFFFFF, rk.REG_CNA_DMA_CON1))
+  ops.append(_npuop(OP_REG_CNA, cna["surf_stride"] & 0xFFFFFFF, rk.REG_CNA_DMA_CON2))
+  value = ((cna["dma_width"] & 0x7FF) << 16) | (cna["dma_height"] & 0x7FF)
+  ops.append(_npuop(OP_REG_CNA, value, rk.REG_CNA_FC_DATA_SIZE0))
+  ops.append(_npuop(OP_REG_CNA, cna["dma_channel"] & 0xFFFF, rk.REG_CNA_FC_DATA_SIZE1))
+  ops.extend([
+    _npuop(OP_REG_CNA, 0x0, rk.REG_CNA_DCOMP_CTRL),
+    _npuop(OP_REG_CNA, 0x0, rk.REG_CNA_DCOMP_REGNUM),
+    _npuop(OP_REG_CNA, cna["decompress_addr0"], rk.REG_CNA_DCOMP_ADDR0),
+  ])
+  for idx in range(16):
+    reg = getattr(rk, f"REG_CNA_DCOMP_AMOUNT{idx}")
+    ops.append(_npuop(OP_REG_CNA, 0x0, reg))
+  ops.append(_npuop(OP_REG_CNA, 0x0, rk.REG_CNA_CVT_CON5))
+  ops.append(_npuop(OP_REG_CNA, 0x0, rk.REG_CNA_PAD_CON1))
+
+  value = ((core["proc_precision"] & 0x7) << 8) | (core["qd_en"] & 0x1)
+  ops.append(_npuop(OP_REG_CORE, value, rk.REG_CORE_MISC_CFG))
+  value = ((core["dataout_height"] & 0xFFFF) << 16) | (core["dataout_width"] & 0xFFFF)
+  ops.append(_npuop(OP_REG_CORE, value, rk.REG_CORE_DATAOUT_SIZE_0))
+  ops.append(_npuop(OP_REG_CORE, core["dataout_channel"] & 0xFFFF, rk.REG_CORE_DATAOUT_SIZE_1))
+  ops.append(_npuop(OP_REG_CORE, 0x0, rk.REG_CORE_CLIP_TRUNCATE))
+  ops.append(_npuop(OP_REG_CORE, 0x0, REG_CORE_3030))
+
+  value = ((dpu["burst_len"] & 0xF) << 5) | ((dpu["conv_mode"] & 0x3) << 3) | ((dpu["output_mode"] & 0x3) << 1) | (dpu["flying_mode"] & 0x1)
+  ops.append(_npuop(OP_REG_DPU, value, rk.REG_DPU_FEATURE_MODE_CFG))
+  value = ((dpu["out_precision"] & 0x7) << 29) | ((dpu["in_precision"] & 0x7) << 26) | (dpu["proc_precision"] & 0x7)
+  ops.append(_npuop(OP_REG_DPU, value, rk.REG_DPU_DATA_FORMAT))
+  ops.append(_npuop(OP_REG_DPU, 0x0, rk.REG_DPU_OFFSET_PEND))
+  ops.append(_npuop(OP_REG_DPU, dpu["dst_base_addr"], rk.REG_DPU_DST_BASE_ADDR))
+  ops.append(_npuop(OP_REG_DPU, (dpu["dst_surf_stride"] & 0xFFFFFFF) << 4, rk.REG_DPU_DST_SURF_STRIDE))
+  ops.append(_npuop(OP_REG_DPU, dpu["width"] & 0x1FFF, rk.REG_DPU_DATA_CUBE_WIDTH))
+  ops.append(_npuop(OP_REG_DPU, dpu["height"] & 0x1FFF, rk.REG_DPU_DATA_CUBE_HEIGHT))
+  ops.append(_npuop(OP_REG_DPU, 0x0, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR))
+  value = ((dpu["channel"] & 0x1FFF) << 16) | (dpu["channel"] & 0x1FFF)
+  ops.append(_npuop(OP_REG_DPU, value, rk.REG_DPU_DATA_CUBE_CHANNEL))
+  value = ((dpu["bs_relu_bypass"] & 0x1) << 6) | ((dpu["bs_mul_bypass"] & 0x1) << 4) | ((dpu["bs_alu_bypass"] & 0x1) << 1) | (dpu["bs_bypass"] & 0x1)
+  ops.append(_npuop(OP_REG_DPU, value, rk.REG_DPU_BS_CFG))
+  for reg in (rk.REG_DPU_BS_ALU_CFG, rk.REG_DPU_BS_MUL_CFG, rk.REG_DPU_BS_RELUX_CMP_VALUE):
+    ops.append(_npuop(OP_REG_DPU, 0x0, reg))
+  value = ((dpu["size_e_2"] & 0x7) << 8) | ((dpu["size_e_1"] & 0x7) << 5) | ((dpu["size_e_0"] & 0x7) << 2) | ((dpu["od_bypass"] & 0x1) << 1)
+  ops.append(_npuop(OP_REG_DPU, value, rk.REG_DPU_BS_OW_CFG))
+  ops.append(_npuop(OP_REG_DPU, 0x0, rk.REG_DPU_BS_OW_OP))
+  ops.append(_npuop(OP_REG_DPU, dpu["channel_wdma"] & 0x1FFF, rk.REG_DPU_WDMA_SIZE_0))
+  value = ((dpu["height_wdma"] & 0x1FFF) << 16) | (dpu["width_wdma"] & 0x1FFF)
+  ops.append(_npuop(OP_REG_DPU, value, rk.REG_DPU_WDMA_SIZE_1))
+  value = ((dpu["bn_relu_bypass"] & 0x1) << 6) | ((dpu["bn_mul_bypass"] & 0x1) << 4) | ((dpu["bn_alu_bypass"] & 0x1) << 1) | (dpu["bn_bypass"] & 0x1)
+  ops.append(_npuop(OP_REG_DPU, value, rk.REG_DPU_BN_CFG))
+  for reg in (rk.REG_DPU_BN_ALU_CFG, rk.REG_DPU_BN_MUL_CFG, rk.REG_DPU_BN_RELUX_CMP_VALUE):
+    ops.append(_npuop(OP_REG_DPU, 0x0, reg))
+  value = ((dpu["ew_relu_bypass"] & 0x1) << 9) | ((dpu["ew_op_cvt_bypass"] & 0x1) << 8) | ((dpu["ew_lut_bypass"] & 0x1) << 7) | ((dpu["ew_op_bypass"] & 0x1) << 1) | (dpu["ew_bypass"] & 0x1)
+  ops.append(_npuop(OP_REG_DPU, value, rk.REG_DPU_EW_CFG))
+  ops.append(_npuop(OP_REG_DPU, 0x0, rk.REG_DPU_EW_CVT_OFFSET_VALUE))
+  ops.append(_npuop(OP_REG_DPU, 0x1, rk.REG_DPU_EW_CVT_SCALE_VALUE))
+  ops.append(_npuop(OP_REG_DPU, 0x0, rk.REG_DPU_EW_RELUX_CMP_VALUE))
+  ops.append(_npuop(OP_REG_DPU, 0x0, rk.REG_DPU_OUT_CVT_OFFSET))
+  value = ((dpu["fp32tofp16_en"] & 0x1) << 16) | (dpu["out_cvt_scale"] & 0xFFFF)
+  ops.append(_npuop(OP_REG_DPU, value, rk.REG_DPU_OUT_CVT_SCALE))
+  ops.append(_npuop(OP_REG_DPU, 0x0, rk.REG_DPU_OUT_CVT_SHIFT))
+  for reg in (
+    rk.REG_DPU_EW_OP_VALUE_0, rk.REG_DPU_EW_OP_VALUE_1, rk.REG_DPU_EW_OP_VALUE_2,
+    rk.REG_DPU_EW_OP_VALUE_3, rk.REG_DPU_EW_OP_VALUE_4, rk.REG_DPU_EW_OP_VALUE_5,
+    rk.REG_DPU_EW_OP_VALUE_6, rk.REG_DPU_EW_OP_VALUE_7):
+    ops.append(_npuop(OP_REG_DPU, 0x0, reg))
+  ops.append(_npuop(OP_REG_DPU, (dpu["surf_add"] & 0xFFFFFFF) << 4, rk.REG_DPU_SURFACE_ADD))
+  ops.append(_npuop(OP_REG_DPU, 0x0, REG_DPU_40C4))
+  for reg in (
+    rk.REG_DPU_LUT_ACCESS_CFG, rk.REG_DPU_LUT_ACCESS_DATA, rk.REG_DPU_LUT_CFG, rk.REG_DPU_LUT_INFO,
+    rk.REG_DPU_LUT_LE_START, rk.REG_DPU_LUT_LE_END, rk.REG_DPU_LUT_LO_START, rk.REG_DPU_LUT_LO_END,
+    rk.REG_DPU_LUT_LE_SLOPE_SCALE, rk.REG_DPU_LUT_LE_SLOPE_SHIFT,
+    rk.REG_DPU_LUT_LO_SLOPE_SCALE, rk.REG_DPU_LUT_LO_SLOPE_SHIFT):
+    ops.append(_npuop(OP_REG_DPU, 0x0, reg))
+
+  ops.append(_npuop(OP_NONE, 0x0, 0x0))
+  ops.append(_npuop(OP_REG_PC, 0x0, rk.REG_PC_REGISTER_AMOUNTS))
+  ops.append(_npuop(OP_40, 0x0, 0x0))
+  ops.append(_npuop(OP_ENABLE, PC_ENABLE_DPU | PC_ENABLE_CNA | PC_ENABLE, rk.REG_PC_OPERATION_ENABLE))
+
+  for idx, val in enumerate(ops):
+    tasks[idx] = ctypes.c_uint64(val)
+  return 0
 
 
 def storage_fmt_for_dtype(dtype: DType):
@@ -619,7 +886,6 @@ class RockchipProgram:
         Npad % MATMUL_CHANNEL_ALIGN != 0):
       raise RuntimeError("unsupported matmul configuration for Rockchip template")
 
-    _load_matmul_lib()
     tasks_arr = (ctypes.c_uint64 * 112)()
     params = MatmulParams()
     params.m = Mpad
@@ -630,14 +896,7 @@ class RockchipProgram:
     params.output_dma = output_dma & 0xffffffff
     params.tasks = ctypes.cast(tasks_arr, ctypes.POINTER(ctypes.c_uint64))
     params.fp32tofp16 = 0
-    try:
-      if getenv("DEBUG"):
-        print("matmul gen fn", _MATMUL_GEN_FP16)
-      ret = _MATMUL_GEN_FP16(ctypes.byref(params))
-    except TypeError as exc:
-      if getenv("DEBUG"):
-        print("matmul gen call failed", exc, repr(ctypes.byref(params)))
-      raise
+    ret = _gen_matmul_fp16(params)
     if ret != 0:
       raise RuntimeError(f"gen_matmul_fp16 returned {ret}")
     return [tasks_arr[i] for i in range(112)]
