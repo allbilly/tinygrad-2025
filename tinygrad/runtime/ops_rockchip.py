@@ -558,14 +558,12 @@ class RockchipProgram:
     feature_arr = np.zeros((Mpad * Kpad,), dtype=np.float16)
     for m in range(M):
       for k in range(K):
-        idx = _feature_fp16_index(Kpad, Mpad, k, m)
-        feature_arr[idx] = a[m, k]
+        feature_arr[_feature_fp16_index(Kpad, Mpad, k, m)] = a[m, k]
 
     weight_arr = np.zeros((Npad * Kpad,), dtype=np.float16)
     for n in range(N):
       for k in range(K):
-        idx = _weight_fp16_index(Kpad, n, k)
-        weight_arr[idx] = b[k, n]
+        weight_arr[_weight_fp16_index(Kpad, n, k)] = b[k, n]
 
     key = (Mpad, Kpad, Npad)
     if key not in self.matmul_bufs:
@@ -576,10 +574,8 @@ class RockchipProgram:
     else:
       input_buf, weight_buf, output_buf = self.matmul_bufs[key]
 
-    feats_bytes = feature_arr.tobytes()
-    w_bytes = weight_arr.tobytes()
-    ctypes.memmove(input_buf.va_addr, feats_bytes, len(feats_bytes))
-    ctypes.memmove(weight_buf.va_addr, w_bytes, len(w_bytes))
+    ctypes.memmove(input_buf.va_addr, feature_arr.tobytes(), feature_arr.nbytes)
+    ctypes.memmove(weight_buf.va_addr, weight_arr.tobytes(), weight_arr.nbytes)
     if getenv("DEBUG"):
       print("matmul dma", hex(input_buf.meta.dma_addr), hex(weight_buf.meta.dma_addr), hex(output_buf.meta.dma_addr))
 
@@ -593,17 +589,22 @@ class RockchipProgram:
     if getenv("DEBUG"):
       coords = [(i, j, out_mat[i, j]) for i in range(Mpad) for j in range(Npad) if not np.isclose(out_mat[i, j], 0)]
       print("raw matmul nonzero coords", coords[:32])
-    gathered = np.zeros((M, N), dtype=np.float32)
-    for row_idx in range(0, Npad, 4):
-      row_group = row_idx // 4
-      if row_idx >= Mpad: break
-      for col_idx in range(Mpad):
-        m = col_idx // 4
-        if m >= M: continue
-        n = row_group * 4 + (col_idx % 4)
-        if n >= N: continue
-        gathered[m, n] = out_mat[row_idx, col_idx]
-    trimmed = gathered.astype(np.float16).reshape(-1)
+    if getenv("ROCKCHIP_DUMP_RAW"):
+      np.save("/tmp/rockchip_matmul_raw.npy", out_mat)
+    decoded = np.zeros((Mpad, Npad), dtype=np.float32)
+    # Rockchip stores the matmul tile as interleaved grids: ri mod 4 picks a block of (Mpad//4) rows
+    # and ri // 4 selects a group of 4 columns. Within each tile ci // 4 steps through rows and ci % 4
+    # picks the column inside the group.
+    row_tile = Mpad // 4
+    for ri in range(Mpad):
+      for ci in range(Npad):
+        val = out_mat[ri, ci]
+        if val == 0: continue
+        row_idx = (ri % 4) * row_tile + (ci // 4)
+        col_idx = (ri // 4) * 4 + (ci % 4)
+        if row_idx < Mpad and col_idx < Npad:
+          decoded[row_idx, col_idx] = val
+    trimmed = decoded[:M, :N].astype(np.float16).reshape(-1)
     out_bytes = trimmed.tobytes()
     if isinstance(out_buf, HCQBuffer):
       ctypes.memmove(out_buf.va_addr, out_bytes, len(out_bytes))
@@ -613,7 +614,9 @@ class RockchipProgram:
 
   def _build_matmul_queue(self, Mpad:int, Kpad:int, Npad:int,
                           input_dma:int, weight_dma:int, output_dma:int) -> list[int]:
-    if not (Mpad == MATMUL_CHANNEL_ALIGN and Kpad == MATMUL_CHANNEL_ALIGN and Npad == MATMUL_CHANNEL_ALIGN):
+    if (Mpad % MATMUL_CHANNEL_ALIGN != 0 or
+        Kpad % MATMUL_CHANNEL_ALIGN != 0 or
+        Npad % MATMUL_CHANNEL_ALIGN != 0):
       raise RuntimeError("unsupported matmul configuration for Rockchip template")
 
     _load_matmul_lib()
