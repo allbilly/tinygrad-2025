@@ -589,10 +589,21 @@ class RockchipProgram:
 
     out_bytes = ctypes.create_string_buffer(Mpad * Npad * ctypes.sizeof(ctypes.c_float))
     ctypes.memmove(out_bytes, output_buf.va_addr, out_bytes._length_)
-    out_mat = np.frombuffer(out_bytes, dtype=np.float32)
+    out_mat = np.frombuffer(out_bytes, dtype=np.float32).reshape(Mpad, Npad)
     if getenv("DEBUG"):
-      print("raw matmul nonzero rows", np.nonzero(out_mat)[0][:16])
-    trimmed = out_mat[:M * N].astype(np.float16)
+      coords = [(i, j, out_mat[i, j]) for i in range(Mpad) for j in range(Npad) if not np.isclose(out_mat[i, j], 0)]
+      print("raw matmul nonzero coords", coords[:32])
+    gathered = np.zeros((M, N), dtype=np.float32)
+    for row_idx in range(0, Npad, 4):
+      row_group = row_idx // 4
+      if row_idx >= Mpad: break
+      for col_idx in range(Mpad):
+        m = col_idx // 4
+        if m >= M: continue
+        n = row_group * 4 + (col_idx % 4)
+        if n >= N: continue
+        gathered[m, n] = out_mat[row_idx, col_idx]
+    trimmed = gathered.astype(np.float16).reshape(-1)
     out_bytes = trimmed.tobytes()
     if isinstance(out_buf, HCQBuffer):
       ctypes.memmove(out_buf.va_addr, out_bytes, len(out_bytes))
