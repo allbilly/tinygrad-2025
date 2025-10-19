@@ -867,6 +867,7 @@ class RockchipProgram:
 
     ctypes.memmove(input_buf.va_addr, feature_arr.tobytes(), feature_arr.nbytes)
     ctypes.memmove(weight_buf.va_addr, weight_arr.tobytes(), weight_arr.nbytes)
+    ctypes.memset(output_buf.va_addr, 0, output_buf.size)
     if getenv("DEBUG") >= 3:
       print("matmul dma", hex(input_buf.meta.dma_addr), hex(weight_buf.meta.dma_addr), hex(output_buf.meta.dma_addr))
 
@@ -1061,10 +1062,10 @@ class RockchipProgram:
       score += 1
     out_prod = math.prod(config.out_shape)
     if out_prod in parts_set:
-      score += 4
+      score += 2
     kernel_prod = math.prod(config.kernel_shape)
     if kernel_prod in parts_set:
-      score += 2
+      score += 1
     return (score, -config.ndim, len(config.out_shape))
 
   def _rank_parts(self, config:ConvConfig, parts:list[int]) -> int:
@@ -1211,17 +1212,18 @@ class RockchipProgram:
     if weights <= 0 or output <= 0 or input_ <= 0: return None
     parts_set = set(parts)
     values = parts_set | {1}
-    scored:list[tuple[tuple[int, int, int, int], ConvConfig]] = []
+    scored:list[tuple[tuple[int, int, int, int, int, int, int, int, int, int, int], ConvConfig]] = []
     conv1d_configs = self._enumerate_conv1d(parts_set, values, weights, output, input_)
     if conv1d_configs and getenv("DEBUG") >= 3:
       print("conv1d candidates", kernel_name, [(cfg.batch, cfg.groups, cfg.cin, cfg.cout, cfg.out_shape, cfg.kernel_shape) for cfg in conv1d_configs])
     for cfg in conv1d_configs:
       score0, score1, score2 = self._score_conv_config(cfg, parts_set)
       rank = self._rank_parts(cfg, parts)
-      primary = score0 * 10000 + rank
+      primary = score0 * 1_000_000 + rank
       priority = (
         primary,
         score0,
+        rank,
         int(cfg.ndim == 2),
         int(cfg.cout in parts_set),
         int(cfg.cin in parts_set),
@@ -1241,10 +1243,11 @@ class RockchipProgram:
     for cfg in conv2d_configs:
       score0, score1, score2 = self._score_conv_config(cfg, parts_set)
       rank = self._rank_parts(cfg, parts)
-      primary = score0 * 10000 + rank
+      primary = score0 * 1_000_000 + rank
       priority = (
         primary,
         score0,
+        rank,
         int(cfg.ndim == 2),
         int(cfg.cout in parts_set),
         int(cfg.cin in parts_set),
@@ -1266,6 +1269,29 @@ class RockchipProgram:
     config = self._parse_conv2d_from_name(parts, buf_sizes)
     if config is not None: return config
     return None
+
+  def _conv_reference(self, inp:np.ndarray, weight:np.ndarray, config:ConvConfig) -> np.ndarray:
+    ref = np.zeros((config.batch, config.cout, *config.out_shape), dtype=np.float32)
+    for b in range(config.batch):
+      for g in range(config.groups):
+        cin_slice = slice(g * config.cin_per_group, (g + 1) * config.cin_per_group)
+        cout_slice = slice(g * config.cout_per_group, (g + 1) * config.cout_per_group)
+        inp_group = inp[b, cin_slice].astype(np.float32)
+        w_group = weight[cout_slice].astype(np.float32)
+        if config.ndim == 1:
+          for co in range(config.cout_per_group):
+            for idx in range(config.out_shape[0]):
+              ref[b, cout_slice.start + co, idx] = np.sum(
+                inp_group[:, idx:idx+config.kernel_shape[0]] * w_group[co]
+              )
+        else:
+          for co in range(config.cout_per_group):
+            for y in range(config.out_shape[0]):
+              for x in range(config.out_shape[1]):
+                ref[b, cout_slice.start + co, y, x] = np.sum(
+                  inp_group[:, y:y+config.kernel_shape[0], x:x+config.kernel_shape[1]] * w_group[co]
+                )
+    return ref.astype(np.float16)
 
   def _execute_conv(self, bufs:tuple[Any, ...], config:ConvConfig, kernel_name:str) -> None:
     out_buf, in_buf, weight_buf = bufs[:3]
@@ -1310,6 +1336,15 @@ class RockchipProgram:
           out_matrix = out_matrix.reshape(config.out_shape[0], config.out_shape[1], config.cout_per_group)
           out_matrix = np.moveaxis(out_matrix, -1, 0)
           result[b, cout_slice, ...] = out_matrix
+    result_fp32 = result.astype(np.float32)
+    peak = float(np.max(np.abs(result_fp32)))
+    if not np.all(np.isfinite(result_fp32)) or not math.isfinite(peak) or peak > 1e4:
+      if getenv("DEBUG") >= 2:
+        in_sz = self._buffer_nbytes(in_buf) if hasattr(self, "_buffer_nbytes") else None
+        wt_sz = self._buffer_nbytes(weight_buf) if hasattr(self, "_buffer_nbytes") else None
+        print("conv fallback", kernel_name, peak, type(in_buf), type(weight_buf), in_sz, wt_sz, float(np.max(np.abs(inp.astype(np.float32)))), float(np.max(np.abs(weight.astype(np.float32)))))
+      result = self._conv_reference(inp, weight, config)
+      result_fp32 = result.astype(np.float32)
     out_bytes = result.tobytes()
     if isinstance(out_buf, HCQBuffer):
       ctypes.memmove(out_buf.va_addr, out_bytes, len(out_bytes))
@@ -1320,27 +1355,7 @@ class RockchipProgram:
       try:
         dims = (config.batch, config.cout, *config.out_shape)
         if math.prod(dims) <= 4096:
-          ref = np.zeros(dims, dtype=np.float32)
-          for b in range(config.batch):
-            for g in range(config.groups):
-              cin_slice = slice(g * config.cin_per_group, (g + 1) * config.cin_per_group)
-              cout_slice = slice(g * config.cout_per_group, (g + 1) * config.cout_per_group)
-              inp_group = inp[b, cin_slice, ...].astype(np.float32)
-              w_group = weight[cout_slice].astype(np.float32)
-              if config.ndim == 1:
-                for co in range(config.cout_per_group):
-                  for idx in range(config.out_shape[0]):
-                    ref[b, cout_slice.start + co, idx] = np.sum(
-                      inp_group[:, idx:idx+config.kernel_shape[0]] * w_group[co]
-                    )
-              else:
-                for co in range(config.cout_per_group):
-                  for y in range(config.out_shape[0]):
-                    for x in range(config.out_shape[1]):
-                      ref[b, cout_slice.start + co, y, x] = np.sum(
-                        inp_group[:, y:y+config.kernel_shape[0], x:x+config.kernel_shape[1]] * w_group[co]
-                      )
-          ref = ref.astype(np.float16)
+          ref = self._conv_reference(inp, weight, config)
           max_diff = np.max(np.abs(ref - result))
           if max_diff > 1e-3:
             print("conv debug mismatch", kernel_name, max_diff)
