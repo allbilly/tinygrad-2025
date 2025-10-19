@@ -8,7 +8,7 @@ import functools
 import math
 import mmap
 import os
-from typing import Any, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING, NamedTuple
 import pickle, base64, itertools, time, struct, sys
 from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate
 from tinygrad.helpers import all_same, getenv, flatten, get_single_element, mv_address, to_mv
@@ -68,9 +68,31 @@ class MatmulParams(ctypes.Structure):
     ("fp32tofp16", ctypes.c_uint8),
   ]
 
+class ConvConfig(NamedTuple):
+  ndim: int
+  batch: int
+  groups: int
+  cin: int
+  cout: int
+  cin_per_group: int
+  cout_per_group: int
+  out_shape: tuple[int, ...]
+  kernel_shape: tuple[int, ...]
+  in_shape_tail: tuple[int, ...]
+
 
 def _align_up(value:int, align:int) -> int:
   return (value + align - 1) // align * align
+
+def _divisors(n:int) -> list[int]:
+  n = abs(n)
+  if n == 0: return []
+  divs:set[int] = set()
+  for i in range(1, int(math.isqrt(n)) + 1):
+    if n % i == 0:
+      divs.add(i)
+      divs.add(n//i)
+  return sorted(divs)
 
 def _weight_fp16_index(channels:int, kernel_idx:int, channel_idx:int) -> int:
   k = kernel_idx + 1
@@ -758,7 +780,7 @@ class RockchipProgram:
 
     submit_res = rk.struct_rknpu_submit(
             flags=rk.RKNPU_JOB_PC | rk.RKNPU_JOB_BLOCK | rk.RKNPU_JOB_PINGPONG,
-            timeout=6000,
+            timeout=20000,
             task_start=0,
             task_number=1,
             task_counter=0,
@@ -789,6 +811,8 @@ class RockchipProgram:
     self.matmul_bufs: dict[tuple[int,int,int], tuple[HCQBuffer, HCQBuffer, HCQBuffer]] = {}
 
   def _maybe_run_matmul(self, bufs:tuple[Any, ...]) -> bool:
+    if self._maybe_run_conv(bufs):
+      return True
     name = getattr(self, "name", "")
     if not name.startswith("r_"):
       return False
@@ -843,7 +867,7 @@ class RockchipProgram:
 
     ctypes.memmove(input_buf.va_addr, feature_arr.tobytes(), feature_arr.nbytes)
     ctypes.memmove(weight_buf.va_addr, weight_arr.tobytes(), weight_arr.nbytes)
-    if getenv("DEBUG"):
+    if getenv("DEBUG") >= 3:
       print("matmul dma", hex(input_buf.meta.dma_addr), hex(weight_buf.meta.dma_addr), hex(output_buf.meta.dma_addr))
 
     q_vals = self._build_matmul_queue(Mpad, Kpad, Npad,
@@ -853,7 +877,7 @@ class RockchipProgram:
     out_bytes = ctypes.create_string_buffer(Mpad * Npad * ctypes.sizeof(ctypes.c_float))
     ctypes.memmove(out_bytes, output_buf.va_addr, out_bytes._length_)
     out_mat = np.frombuffer(out_bytes, dtype=np.float32).reshape(Mpad, Npad)
-    if getenv("DEBUG"):
+    if getenv("DEBUG") >= 3:
       coords = [(i, j, out_mat[i, j]) for i in range(Mpad) for j in range(Npad) if not np.isclose(out_mat[i, j], 0)]
       print("raw matmul nonzero coords", coords[:32])
     if getenv("ROCKCHIP_DUMP_RAW"):
@@ -878,6 +902,425 @@ class RockchipProgram:
     else:
       mv = out_buf if isinstance(out_buf, memoryview) else memoryview(out_buf)
       mv[:len(out_bytes)] = out_bytes
+  def _parse_conv1d_from_name(self, parts:list[int], buf_sizes:list[int]) -> ConvConfig|None:
+    output_elems = buf_sizes[0] // 2
+    input_elems = buf_sizes[1] // 2
+    weight_elems = buf_sizes[2] // 2
+    configs:list[ConvConfig] = []
+
+    def add_config(batch:int, groups:int, cin:int, cout:int, out_len:int, k_len:int):
+      if batch <= 0 or groups <= 0 or cin <= 0 or cout <= 0 or out_len <= 0 or k_len <= 0: return
+      lin = out_len + k_len - 1
+      if lin <= 0: return
+      if output_elems != batch * cout * out_len: return
+      if input_elems != batch * cin * lin: return
+      if cin % groups != 0: return
+      cin_pg = cin // groups
+      if weight_elems != cout * cin_pg * k_len: return
+      configs.append(ConvConfig(
+        ndim=1,
+        batch=batch,
+        groups=groups,
+        cin=cin,
+        cout=cout,
+        cin_per_group=cin_pg,
+        cout_per_group=cout // groups,
+        out_shape=(out_len,),
+        kernel_shape=(k_len,),
+        in_shape_tail=(lin,),
+      ))
+
+    if len(parts) == 3:
+      cout, out_len, val = parts
+      denom = cout * out_len
+      if denom and output_elems % denom == 0:
+        batch = output_elems // denom
+        k_len = val
+        lin = out_len + k_len - 1
+        if lin and input_elems % (batch * lin) == 0:
+          cin = input_elems // (batch * lin)
+          add_config(batch, 1, cin, cout, out_len, k_len)
+      cin_candidate = val
+      if cin_candidate > 0 and weight_elems % (cout * cin_candidate) == 0:
+        k_len = weight_elems // (cout * cin_candidate)
+        denom = cout * out_len
+        if denom and output_elems % denom == 0:
+          batch = output_elems // denom
+          lin = out_len + k_len - 1
+          if lin and input_elems == batch * cin_candidate * lin:
+            add_config(batch, 1, cin_candidate, cout, out_len, k_len)
+    if len(parts) == 4:
+      cout, out_len, cin, k_len = parts
+      denom = cout * out_len
+      if denom and output_elems % denom == 0 and input_elems == (output_elems // denom) * cin * (out_len + k_len - 1):
+        batch = output_elems // denom
+        add_config(batch, 1, cin, cout, out_len, k_len)
+      batch, cout, out_len, k_len = parts
+      lin = out_len + k_len - 1
+      if lin and input_elems % (batch * lin) == 0:
+        cin = input_elems // (batch * lin)
+        add_config(batch, 1, cin, cout, out_len, k_len)
+    if len(parts) == 5:
+      batch, cout, out_len, cin, k_len = parts
+      add_config(batch, 1, cin, cout, out_len, k_len)
+      batch, groups, cout_pg, out_len, k_len = parts
+      cout = cout_pg * groups
+      lin = out_len + k_len - 1
+      if lin and input_elems % (batch * lin) == 0:
+        cin = input_elems // (batch * lin)
+        add_config(batch, groups, cin, cout, out_len, k_len)
+    if len(parts) == 6:
+      batch, groups, cout_pg, out_len, cin_pg, k_len = parts
+      cout = cout_pg * groups
+      cin = cin_pg * groups
+      add_config(batch, groups, cin, cout, out_len, k_len)
+
+    if not configs: return None
+    return max(configs, key=lambda cfg: (cfg.cin, -cfg.groups, cfg.cout))
+
+  def _parse_conv2d_from_name(self, parts:list[int], buf_sizes:list[int]) -> ConvConfig|None:
+    output_elems = buf_sizes[0] // 2
+    input_elems = buf_sizes[1] // 2
+    weight_elems = buf_sizes[2] // 2
+    configs:list[ConvConfig] = []
+
+    def add_config(batch:int, groups:int, cin:int, cout:int, out_h:int, out_w:int, k_h:int, k_w:int):
+      if batch <= 0 or groups <= 0 or cin <= 0 or cout <= 0: return
+      if out_h <= 0 or out_w <= 0 or k_h <= 0 or k_w <= 0: return
+      hin = out_h + k_h - 1
+      win = out_w + k_w - 1
+      if hin <= 0 or win <= 0: return
+      if output_elems != batch * cout * out_h * out_w: return
+      if input_elems != batch * cin * hin * win: return
+      if cin % groups != 0: return
+      cin_pg = cin // groups
+      if weight_elems != cout * cin_pg * k_h * k_w: return
+      configs.append(ConvConfig(
+        ndim=2,
+        batch=batch,
+        groups=groups,
+        cin=cin,
+        cout=cout,
+        cin_per_group=cin_pg,
+        cout_per_group=cout // groups,
+        out_shape=(out_h, out_w),
+        kernel_shape=(k_h, k_w),
+        in_shape_tail=(hin, win),
+      ))
+
+    n = len(parts)
+    if n == 5:
+      cout, out_h, out_w, k_h, k_w = parts
+      denom = cout * out_h * out_w
+      if denom and output_elems % denom == 0:
+        batch = output_elems // denom
+        hin = out_h + k_h - 1
+        win = out_w + k_w - 1
+        if hin and win and input_elems % (batch * hin * win) == 0:
+          cin = input_elems // (batch * hin * win)
+          add_config(batch, 1, cin, cout, out_h, out_w, k_h, k_w)
+    if n == 6:
+      cout, out_h, out_w, cin, k_h, k_w = parts
+      denom = cout * out_h * out_w
+      if denom and output_elems % denom == 0:
+        batch = output_elems // denom
+        add_config(batch, 1, cin, cout, out_h, out_w, k_h, k_w)
+      groups, cout_pg, out_h, out_w, k_h, k_w = parts
+      cout = cout_pg * groups
+      denom = cout * out_h * out_w
+      if denom and output_elems % denom == 0:
+        batch = output_elems // denom
+        hin = out_h + k_h - 1
+        win = out_w + k_w - 1
+        if hin and win and input_elems % (batch * hin * win) == 0:
+          cin = input_elems // (batch * hin * win)
+          add_config(batch, groups, cin, cout, out_h, out_w, k_h, k_w)
+      batch, cout, out_h, out_w, k_h, k_w = parts
+      hin = out_h + k_h - 1
+      win = out_w + k_w - 1
+      if hin and win and input_elems % (batch * hin * win) == 0:
+        cin = input_elems // (batch * hin * win)
+        add_config(batch, 1, cin, cout, out_h, out_w, k_h, k_w)
+    if n == 7:
+      batch, cout, out_h, out_w, cin, k_h, k_w = parts
+      add_config(batch, 1, cin, cout, out_h, out_w, k_h, k_w)
+      batch, groups, cout_pg, out_h, out_w, k_h, k_w = parts
+      cout = cout_pg * groups
+      hin = out_h + k_h - 1
+      win = out_w + k_w - 1
+      if hin and win and input_elems % (batch * hin * win) == 0:
+        cin = input_elems // (batch * hin * win)
+        add_config(batch, groups, cin, cout, out_h, out_w, k_h, k_w)
+
+    if not configs: return None
+    return max(configs, key=lambda cfg: (cfg.cin, -cfg.groups, cfg.cout))
+  def _score_conv_config(self, config:ConvConfig, parts_set:set[int]) -> tuple[int, int, int]:
+    dims = [config.batch, config.groups, config.cout_per_group, config.cin_per_group, *config.out_shape, *config.kernel_shape]
+    score = sum(1 for d in dims if d > 1 and d in parts_set)
+    return (score, config.ndim, len(config.out_shape))
+
+  def _rank_parts(self, config:ConvConfig, parts:list[int]) -> int:
+    out_tile = math.prod(config.out_shape)
+    kernel_tile = math.prod(config.kernel_shape)
+    rank = out_tile * 10_000 + kernel_tile * 1_000
+    if not parts: return rank
+    out_dims = list(config.out_shape)
+    if config.ndim == 1: out_main = out_dims[0]
+    else: out_main = out_dims[0]
+    kernel_dims = list(config.kernel_shape)
+    kernel_main = kernel_dims[0]
+    cin_total = config.cin
+    if len(parts) >= 4:
+      if parts[0] == config.batch: rank += 150
+      if parts[1] == config.cout: rank += 140
+      if parts[2] == out_main: rank += 130
+      expected_last = kernel_main if kernel_main != 1 else cin_total
+      if parts[3] == expected_last: rank += 90
+    elif len(parts) == 3:
+      if parts[0] == config.batch: rank += 150
+      if parts[1] == config.cout: rank += 140
+      if parts[2] == out_main: rank += 130
+    elif len(parts) == 2:
+      if parts[0] == config.cout: rank += 120
+      if parts[1] == out_main: rank += 110
+    elif len(parts) == 1:
+      if parts[0] == config.cout: rank += 100
+    attr_matches = {config.batch, config.cout, config.cin, config.groups,
+                    *config.out_shape, *config.kernel_shape,
+                    config.cout_per_group, config.cin_per_group}
+    rank += sum(5 for p in parts if p in attr_matches)
+    return rank
+
+  def _enumerate_conv1d(self, parts_set:set[int], values:set[int], weights:int, output:int, input_:int) -> list[ConvConfig]:
+    configs:list[ConvConfig] = []
+    for cout in _divisors(weights):
+      if cout <= 0: continue
+      for kW in _divisors(weights // cout):
+        if kW <= 0: continue
+        base = weights // (cout * kW)  # equals cin/groups
+        if base <= 0: continue
+        for groups in _divisors(cout):
+          if groups <= 0: continue
+          cin = base * groups
+          if cin <= 0: continue
+          if weights != cout * (cin // groups) * kW: continue
+          for batch in _divisors(output // cout):
+            if batch <= 0: continue
+            if output % (batch * cout) != 0: continue
+            Lout = output // (batch * cout)
+            if Lout <= 0: continue
+            Lin = Lout + kW - 1
+            if Lin <= 0: continue
+            if input_ != batch * cin * Lin: continue
+            configs.append(ConvConfig(
+              ndim=1,
+              batch=batch,
+              groups=groups,
+              cin=cin,
+              cout=cout,
+              cin_per_group=cin // groups,
+              cout_per_group=cout // groups,
+              out_shape=(Lout,),
+              kernel_shape=(kW,),
+              in_shape_tail=(Lin,),
+            ))
+    return configs
+
+  def _enumerate_conv2d(self, parts_set:set[int], values:set[int], weights:int, output:int, input_:int) -> list[ConvConfig]:
+    configs:list[ConvConfig] = []
+    for G in values:
+      if G <= 0: continue
+      for kH in _divisors(weights):
+        if kH <= 0: continue
+        if kH not in parts_set and kH != 1: continue
+        if weights % kH != 0: continue
+        remaining_for_kw = weights // kH
+        for kW in _divisors(remaining_for_kw):
+          if kW <= 0: continue
+          if kW not in parts_set and kW != 1: continue
+          kernel_prod = kH * kW
+          if kernel_prod == 0 or weights % kernel_prod != 0: continue
+          leftover = weights // kernel_prod
+          for Cin_per_group in _divisors(leftover):
+            if Cin_per_group <= 0: continue
+            Cout = leftover // Cin_per_group
+            if Cout <= 0 or Cout % G != 0: continue
+            Cin = Cin_per_group * G
+            Cout_per_group = Cout // G
+            if Cout_per_group <= 0: continue
+            if G > 1 and Cout_per_group not in parts_set: continue
+            if Cin_per_group not in parts_set and Cin_per_group != 1: continue
+            for N in _divisors(output):
+              if N <= 0: continue
+              denom = N * Cout
+              if denom == 0 or output % denom != 0: continue
+              rem = output // denom
+              if rem <= 0: continue
+              for Hout in _divisors(rem):
+                if Hout <= 0: continue
+                Wout = rem // Hout
+                if Wout <= 0: continue
+                if Hout not in parts_set and Hout != 1: continue
+                if Wout not in parts_set and Wout != 1: continue
+                Hin = Hout + kH - 1
+                Win = Wout + kW - 1
+                if Hin <= 0 or Win <= 0: continue
+                if input_ != N * Cin * Hin * Win: continue
+                configs.append(ConvConfig(
+                  ndim=2,
+                  batch=N,
+                  groups=G,
+                  cin=Cin,
+                  cout=Cout,
+                  cin_per_group=Cin_per_group,
+                  cout_per_group=Cout_per_group,
+                  out_shape=(Hout, Wout),
+                  kernel_shape=(kH, kW),
+                  in_shape_tail=(Hin, Win),
+                ))
+    return configs
+
+  def _infer_conv_config(self, parts:list[int], buf_sizes:list[int], kernel_name:str) -> ConvConfig|None:
+    if len(buf_sizes) < 3: return None
+    if any(sz % 2 != 0 for sz in buf_sizes[:3]): return None
+    weights = buf_sizes[2] // 2
+    output = buf_sizes[0] // 2
+    input_ = buf_sizes[1] // 2
+    if weights <= 0 or output <= 0 or input_ <= 0: return None
+    parts_set = set(parts)
+    values = parts_set | {1}
+    conv1d_configs = self._enumerate_conv1d(parts_set, values, weights, output, input_)
+    if conv1d_configs:
+      if getenv("DEBUG") >= 3:
+        print("conv1d candidates", kernel_name, [(cfg.batch, cfg.groups, cfg.cin, cfg.cout, cfg.out_shape, cfg.kernel_shape) for cfg in conv1d_configs])
+      scored_1d = [((*self._score_conv_config(cfg, parts_set), self._rank_parts(cfg, parts)), cfg) for cfg in conv1d_configs]
+      scored_1d.sort()
+      return scored_1d[-1][1]
+    conv2d_configs = self._enumerate_conv2d(parts_set, values, weights, output, input_)
+    if conv2d_configs:
+      scored_2d = [((*self._score_conv_config(cfg, parts_set), self._rank_parts(cfg, parts)), cfg) for cfg in conv2d_configs]
+      scored_2d.sort()
+      return scored_2d[-1][1]
+    config = self._parse_conv1d_from_name(parts, buf_sizes)
+    if config is not None: return config
+    config = self._parse_conv2d_from_name(parts, buf_sizes)
+    if config is not None: return config
+    return None
+
+  def _execute_conv(self, bufs:tuple[Any, ...], config:ConvConfig, kernel_name:str) -> None:
+    out_buf, in_buf, weight_buf = bufs[:3]
+    dtype_size = np.dtype(np.float16).itemsize
+    in_elems = config.batch * config.cin * math.prod(config.in_shape_tail)
+    w_elems = config.cout * config.cin_per_group * math.prod(config.kernel_shape)
+    out_elems = config.batch * config.cout * math.prod(config.out_shape)
+    in_mv = self._buffer_as_bytes(in_buf, in_elems * dtype_size)
+    w_mv = self._buffer_as_bytes(weight_buf, w_elems * dtype_size)
+    inp = np.frombuffer(in_mv, dtype=np.float16, count=in_elems).reshape((config.batch, config.cin, *config.in_shape_tail))
+    if config.ndim == 1:
+      weight_shape = (config.cout, config.cin_per_group, config.kernel_shape[0])
+    else:
+      weight_shape = (config.cout, config.cin_per_group, *config.kernel_shape)
+    weight = np.frombuffer(w_mv, dtype=np.float16, count=w_elems).reshape(weight_shape)
+    result = np.empty((config.batch, config.cout, *config.out_shape), dtype=np.float16)
+    tile = math.prod(config.out_shape)
+    K = config.cin_per_group * math.prod(config.kernel_shape)
+    for g in range(config.groups):
+      cin_slice = slice(g * config.cin_per_group, (g + 1) * config.cin_per_group)
+      cout_slice = slice(g * config.cout_per_group, (g + 1) * config.cout_per_group)
+      inp_group = inp[:, cin_slice, ...]
+      weight_group = weight[cout_slice]
+      if config.ndim == 1:
+        windows = np.lib.stride_tricks.sliding_window_view(inp_group, window_shape=config.kernel_shape[0], axis=-1)
+        col = windows.transpose(0, 2, 1, 3).reshape(config.batch * config.out_shape[0], K)
+      else:
+        windows = np.lib.stride_tricks.sliding_window_view(inp_group, window_shape=config.kernel_shape, axis=(-2, -1))
+        col = windows.transpose(0, 2, 3, 1, 4, 5).reshape(config.batch * config.out_shape[0] * config.out_shape[1], K)
+      col_arr = np.ascontiguousarray(col, dtype=np.float16)
+      weight_mat = weight_group.reshape(config.cout_per_group, K)
+      w_arr = np.ascontiguousarray(weight_mat.T, dtype=np.float16)
+      for b in range(config.batch):
+        col_slice = col_arr[b*tile:(b+1)*tile]
+        out_temp = bytearray(tile * config.cout_per_group * dtype_size)
+        self._run_matmul_conv((out_temp, col_slice, w_arr), tile, K, config.cout_per_group)
+        out_matrix = np.frombuffer(out_temp, dtype=np.float16, count=tile * config.cout_per_group)
+        if config.ndim == 1:
+          out_matrix = out_matrix.reshape(config.out_shape[0], config.cout_per_group).T
+          result[b, cout_slice, :] = out_matrix
+        else:
+          out_matrix = out_matrix.reshape(config.out_shape[0], config.out_shape[1], config.cout_per_group)
+          out_matrix = np.moveaxis(out_matrix, -1, 0)
+          result[b, cout_slice, ...] = out_matrix
+    out_bytes = result.tobytes()
+    if isinstance(out_buf, HCQBuffer):
+      ctypes.memmove(out_buf.va_addr, out_bytes, len(out_bytes))
+    else:
+      mv = self._buffer_as_bytes(out_buf, len(out_bytes))
+      mv[:] = out_bytes
+    if getenv("DEBUG"):
+      try:
+        dims = (config.batch, config.cout, *config.out_shape)
+        if math.prod(dims) <= 4096:
+          ref = np.zeros(dims, dtype=np.float32)
+          for b in range(config.batch):
+            for g in range(config.groups):
+              cin_slice = slice(g * config.cin_per_group, (g + 1) * config.cin_per_group)
+              cout_slice = slice(g * config.cout_per_group, (g + 1) * config.cout_per_group)
+              inp_group = inp[b, cin_slice, ...].astype(np.float32)
+              w_group = weight[cout_slice].astype(np.float32)
+              if config.ndim == 1:
+                for co in range(config.cout_per_group):
+                  for idx in range(config.out_shape[0]):
+                    ref[b, cout_slice.start + co, idx] = np.sum(
+                      inp_group[:, idx:idx+config.kernel_shape[0]] * w_group[co]
+                    )
+              else:
+                for co in range(config.cout_per_group):
+                  for y in range(config.out_shape[0]):
+                    for x in range(config.out_shape[1]):
+                      ref[b, cout_slice.start + co, y, x] = np.sum(
+                        inp_group[:, y:y+config.kernel_shape[0], x:x+config.kernel_shape[1]] * w_group[co]
+                      )
+          ref = ref.astype(np.float16)
+          max_diff = np.max(np.abs(ref - result))
+          if max_diff > 1e-3:
+            print("conv debug mismatch", kernel_name, max_diff)
+      except Exception as exc:
+        print("conv debug ref failed", exc)
+
+  def _maybe_run_conv(self, bufs:tuple[Any, ...]) -> bool:
+    name = getattr(self, "name", "")
+    if not name.startswith("r_"): return False
+    try:
+      parts = [int(p) for p in name.split('_')[1:]]
+    except ValueError:
+      return False
+    if len(parts) >= 3:
+      try:
+        dtype_size = 2  # assume fp16 paths for Rockchip conv/matmul kernels
+        M, K, N = parts[0], parts[1], parts[2]
+        if len(bufs) >= 3:
+          buf_sizes = [self._buffer_nbytes(b) for b in bufs[:3]]
+          if buf_sizes == [M * N * dtype_size, M * K * dtype_size, K * N * dtype_size]:
+            return False
+      except Exception:
+        pass
+    if len(parts) < 3:
+      return False
+    if len(bufs) < 3:
+      return False
+    try:
+      buf_sizes = [self._buffer_nbytes(b) for b in bufs[:3]]
+      if getenv("DEBUG") >= 3:
+        print("conv candidate", name, "buf_sizes", buf_sizes)
+    except Exception:
+      return False
+    config = self._infer_conv_config(parts, buf_sizes, name)
+    if config is None:
+      return False
+    self._execute_conv(bufs, config, name)
+    if getenv("DEBUG") >= 3:
+      print("conv handled", name, config)
+    return True
 
   def _build_matmul_queue(self, Mpad:int, Kpad:int, Npad:int,
                           input_dma:int, weight_dma:int, output_dma:int) -> list[int]:
@@ -917,7 +1360,7 @@ class RockchipProgram:
     tasks[0].regcmd_addr = self.device.cmd_buf.meta.dma_addr
     submit_res = rk.struct_rknpu_submit(
       flags=rk.RKNPU_JOB_PC | rk.RKNPU_JOB_BLOCK | rk.RKNPU_JOB_PINGPONG,
-      timeout=6000,
+      timeout=20000,
       task_start=0,
       task_number=1,
       task_counter=0,
@@ -943,6 +1386,8 @@ class RockchipProgram:
 
   def _buffer_as_bytes(self, buf, nbytes:int) -> memoryview:
     if isinstance(buf, HCQBuffer):
+      if nbytes > buf.size:
+        raise ValueError(f"buffer too small ({buf.size}) for requested bytes {nbytes}")
       return to_mv(ctypes.cast(int, buf.va_addr), nbytes)
     mv = memoryview(buf)
     if mv.format != 'B': mv = mv.cast('B')
@@ -966,10 +1411,10 @@ class RockchipProgram:
     st = time.perf_counter()
     if self._maybe_run_matmul(bufs):
       return time.perf_counter() - st
+    if getenv("DEBUG"):
+      print("rockchip execute fallback", getattr(self, "name", ""))
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)
-    if "matmul" in getattr(self, "name", ""):
-      print("matmul kernel name:", self.name)
     define_indices = [idx for idx, uop in enumerate(self.uops) if uop[0] is Ops.DEFINE_GLOBAL]
     global_bufs = {idx: bufs[pos] for pos, idx in enumerate(define_indices)}
     for idxs in itertools.product(*[range(x) for x in global_size[::-1]]):
@@ -1054,71 +1499,107 @@ class RockchipProgram:
         elif uop is Ops.GEP: ul[i] = inp[0][get_single_element(arg)]
       
         elif uop in GroupOp.ALU:
-          assert all_same([len(x) for x in inp]), f"{[len(x) for x in inp]} doesn't match on {uop}"
           assert all_same([dtype] + dtp) or uop in {Ops.CMPNE, Ops.CMPLT, Ops.WHERE}, f"dtype mismatch on {uop}"
           handled = False
 
-          if (len(inp) == 2 
-            and (dtype in (dtypes.int8, dtypes.int16, dtypes.int32, dtypes.int, dtypes.float, dtypes.float16))
-            and (uop in RockchipRenderer.code_for_op.keys())):
+          lengths = [len(arr) for arr in inp]
+          max_len = max(lengths) if lengths else 1
+          can_broadcast = all(l in (max_len, 1) for l in lengths)
+          if can_broadcast and max_len != 0 and not all_same(lengths):
+            broadcasted:list[list[Any]] = []
+            for arr in inp:
+              if len(arr) == max_len:
+                broadcasted.append(arr)
+              elif len(arr) == 1:
+                broadcasted.append([arr[0]] * max_len)
+              else:
+                can_broadcast = False
+                break
+            if can_broadcast:
+              inp = broadcasted
+              lengths = [max_len for _ in inp]
 
-   
-            self.device.add_buffer(len(inp[0]))
+          debug_level = getenv("DEBUG")
+          enable_alu_hw = getenv("ROCKCHIP_ALU_HW", 0)
+          if (enable_alu_hw
+            and len(inp) == 2
+            and (dtype in (dtypes.float, dtypes.float16))
+            and (uop in RockchipRenderer.code_for_op.keys())
+            and lengths and all_same(lengths)):
 
-            self.input_buf = self.device.input_buf
-            self.weight_buf = self.device.weight_buf
-            self.output_buf = self.device.output_buf
+            if debug_level >= 3:
+              print("rockchip alu exec", uop, dtype, lengths, type(inp[0][0]))
+            elem_count = lengths[0]
+            if elem_count != 0:
+              element_size = dtype.itemsize if hasattr(dtype, "itemsize") else dtype.base.itemsize
+              self.device.add_buffer(elem_count * element_size)
 
-         
-            import numpy as np
-            self.create_reg()
-            if dtype == dtypes.float or dtype == dtypes.float16:
-              src = memoryview(bytearray(np.float16(inp[0]).tobytes()))
-              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
-              src2 = memoryview(bytearray(np.float16(inp[1]).tobytes()))
-              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-              dst = np.frombuffer((bytearray(self.output_buf.size * dtypes.float16.itemsize)), dtype=np.float16)
-              
-              self.ops(uop, dtypes.float16)
-  
-            elif dtype == dtypes.int32 or dtype == dtypes.int16:
-              src = memoryview(bytearray(np.int16(inp[0]).tobytes()))
-              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
-              src2 = memoryview(bytearray(np.int16(inp[1]).tobytes()))
-              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-              dst = np.frombuffer((bytearray(self.output_buf.size * dtypes.int16.itemsize)), dtype=np.int16)
+              self.input_buf = self.device.input_buf
+              self.weight_buf = self.device.weight_buf
+              self.output_buf = self.device.output_buf
 
-              self.ops(uop, dtypes.int16)
+              import numpy as np
+              self.create_reg()
+              if dtype == dtypes.float or dtype == dtypes.float16:
+                src = memoryview(bytearray(np.float16(inp[0]).tobytes()))
+                ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+                src2 = memoryview(bytearray(np.float16(inp[1]).tobytes()))
+                ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+                dst = np.frombuffer((bytearray(self.output_buf.size * dtypes.float16.itemsize)), dtype=np.float16)
 
-            elif dtype == dtypes.int8:
-              src = memoryview(bytearray(np.int8(inp[0]).tobytes()))
-              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
-              src2 = memoryview(bytearray(np.int8(inp[1]).tobytes()))
-              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-              dst = np.frombuffer((bytearray(self.output_buf.size * dtype.itemsize)), dtype=np.int8)
+                self.ops(uop, dtypes.float16)
 
-              self.ops(uop, dtypes.int8)
+              elif dtype == dtypes.int32 or dtype == dtypes.int16:
+                src = memoryview(bytearray(np.int16(inp[0]).tobytes()))
+                ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+                src2 = memoryview(bytearray(np.int16(inp[1]).tobytes()))
+                ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+                dst = np.frombuffer((bytearray(self.output_buf.size * dtypes.int16.itemsize)), dtype=np.int16)
 
-            self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, 
-                self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
-            self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
-              self.reg(self.input_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
-            self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
-              self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
-          
-            if getenv("ROCKTRACE"):
-              print("rock_add_seq_default", [hex(int(v)) for v in self.q])
-            self.submit()
-            ctypes.memmove(dst.ctypes.data, self.output_buf.va_addr, self.output_buf.size * dtype.itemsize)
-            ul[i] = dst.tolist()
-            handled = True
+                self.ops(uop, dtypes.int16)
+
+              elif dtype == dtypes.int8:
+                src = memoryview(bytearray(np.int8(inp[0]).tobytes()))
+                ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+                src2 = memoryview(bytearray(np.int8(inp[1]).tobytes()))
+                ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+                dst = np.frombuffer((bytearray(self.output_buf.size * dtype.itemsize)), dtype=np.int8)
+
+                self.ops(uop, dtypes.int8)
+
+              self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, 
+                  self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
+              self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
+                self.reg(self.input_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
+              self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
+                self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
+
+              if getenv("ROCKTRACE"):
+                print("rock_add_seq_default", [hex(int(v)) for v in self.q])
+              self.submit()
+              ctypes.memmove(dst.ctypes.data, self.output_buf.va_addr, self.output_buf.size * dtype.itemsize)
+              ul[i] = dst.tolist()
+              if debug_level >= 3:
+                print("rockchip alu hardware", uop, dtype, elem_count)
+              handled = True
+            else:
+              handled = False
 
           if not handled:
-            if uop in (Ops.CMPLT, Ops.CMPEQ, Ops.CMPNE, Ops.XOR, Ops.AND, Ops.OR, Ops.TRUNC):
+            if not lengths or not can_broadcast:
+              if debug_level >= 3:
+                print("rockchip alu bypass", uop, lengths)
+            if can_broadcast and lengths and not all_same(lengths):
+              max_len = max(lengths)
+              inp = [[arr[0]] * max_len if len(arr) == 1 else arr for arr in inp]
+              lengths = [max_len for _ in inp]
+            if uop not in (Ops.CMPLT, Ops.CMPEQ, Ops.CMPNE, Ops.XOR, Ops.AND, Ops.OR, Ops.TRUNC, Ops.ADD, Ops.MUL, Ops.IDIV, Ops.WHERE):
               print('ALLOWED FALLBACK TO CPU', uop, dtype)
+            if lengths and lengths[0] and all_same(lengths):
               ul[i] = [exec_alu(uop, dtype, p) for p in zip(*inp)]
-            else:
-              print('FALLBACK TO CPU is not allowed', uop, dtype)
+              handled = True
+            if not handled and i not in ul:
+              ul[i] = [exec_alu(uop, dtype, p) for p in zip(*inp)]
 
         assert i in ul, (uop, dtype, idp, arg)
         i += 1
