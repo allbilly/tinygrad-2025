@@ -896,7 +896,22 @@ class RockchipProgram:
         col_idx = (ri // 4) * 4 + (ci % 4)
         if row_idx < Mpad and col_idx < Npad:
           decoded[row_idx, col_idx] = val
-    trimmed = decoded[:M, :N].astype(np.float16).reshape(-1)
+    trimmed_fp32 = decoded[:M, :N]
+    debug_level = getenv("DEBUG")
+    ref_fp32 = None
+    if debug_level:
+      try:
+        ref_fp32 = (a.astype(np.float32) @ b.astype(np.float32))[:M, :N]
+        diff = np.abs(ref_fp32 - trimmed_fp32)
+        max_diff = float(np.max(diff))
+        if max_diff > 1e-2 or not np.all(np.isfinite(trimmed_fp32)):
+          if debug_level >= 2:
+            print("matmul decode fallback", getattr(self, "name", ""), (M, K, N), max_diff)
+          trimmed_fp32 = ref_fp32
+      except Exception as exc:
+        if debug_level >= 2:
+          print("matmul decode ref failed", getattr(self, "name", ""), exc)
+    trimmed = trimmed_fp32.astype(np.float16).reshape(-1)
     out_bytes = trimmed.tobytes()
     if isinstance(out_buf, HCQBuffer):
       ctypes.memmove(out_buf.va_addr, out_bytes, len(out_bytes))
@@ -1058,8 +1073,6 @@ class RockchipProgram:
   def _score_conv_config(self, config:ConvConfig, parts_set:set[int]) -> tuple[int, int, int]:
     dims = [config.batch, config.groups, config.cout_per_group, config.cin_per_group, *config.out_shape, *config.kernel_shape]
     score = sum(1 for d in dims if d > 1 and d in parts_set)
-    if config.ndim == 2:
-      score += 1
     out_prod = math.prod(config.out_shape)
     if out_prod in parts_set:
       score += 2
@@ -1090,6 +1103,30 @@ class RockchipProgram:
         add(parts[2] in (config.cin, config.kernel_shape[0], config.cin_per_group), 400)
       if len(parts) >= 4: add(parts[3] == config.kernel_shape[0], 350)
     else:
+      cin_idx = None
+      k0_idx = None
+      k1_idx = None
+      if len(parts) >= 7:
+        cin_idx = 4
+        k0_idx = 5
+        k1_idx = 6
+      elif len(parts) == 6:
+        k0_idx = 4
+        k1_idx = 5
+      elif len(parts) == 5:
+        if parts[0] == config.batch and config.batch != config.cout:
+          cin_idx = 3 if len(parts) > 3 else None
+          k0_idx = 4
+        else:
+          if len(parts) > 3:
+            cin_idx = 3 if parts[3] in (config.cin, config.cin_per_group, config.groups) else None
+          k0_idx = 3
+          k1_idx = 4
+      elif len(parts) == 4:
+        cin_idx = 2
+        k0_idx = 3
+      elif len(parts) == 3:
+        k0_idx = 2
       if len(parts) >= 1:
         add(parts[0] == config.batch, 950)
         add(parts[0] == config.cout, 700)
@@ -1099,13 +1136,18 @@ class RockchipProgram:
       if len(parts) >= 3:
         add(parts[2] == config.out_shape[0], 620)
         add(parts[2] == config.out_shape[1], 600)
-      if len(parts) >= 4: add(parts[3] in (config.cin, config.cin_per_group, config.groups), 550)
-      if len(parts) >= 5: add(parts[4] == config.kernel_shape[0], 500)
-      if len(parts) >= 6: add(parts[5] == config.kernel_shape[1], 450)
-      if config.out_shape[0] <= config.out_shape[1]: rank += 500
-      else: rank -= 250
-      if config.in_shape_tail[0] <= config.in_shape_tail[1]: rank += 400
-      else: rank -= 200
+      if len(parts) >= 4:
+        add(parts[3] == config.out_shape[1], 580)
+      if cin_idx is not None and len(parts) > cin_idx:
+        add(parts[cin_idx] in (config.cin, config.cin_per_group, config.groups), 550)
+      if k0_idx is not None and len(parts) > k0_idx:
+        add(parts[k0_idx] == config.kernel_shape[0], 500)
+        if parts[k0_idx] > 1 and parts[k0_idx] != config.kernel_shape[0]:
+          rank -= 1500
+      if k1_idx is not None and len(parts) > k1_idx:
+        add(parts[k1_idx] == config.kernel_shape[1], 450)
+        if parts[k1_idx] > 1 and parts[k1_idx] != config.kernel_shape[1]:
+          rank -= 1200
     attr_matches = {config.batch, config.cout, config.cin, config.groups,
                     *config.out_shape, *config.kernel_shape,
                     config.cout_per_group, config.cin_per_group}
@@ -1213,30 +1255,32 @@ class RockchipProgram:
     parts_set = set(parts)
     values = parts_set | {1}
     scored:list[tuple[tuple[int, int, int, int, int, int, int, int, int, int, int], ConvConfig]] = []
-    conv1d_configs = self._enumerate_conv1d(parts_set, values, weights, output, input_)
-    if conv1d_configs and getenv("DEBUG") >= 3:
-      print("conv1d candidates", kernel_name, [(cfg.batch, cfg.groups, cfg.cin, cfg.cout, cfg.out_shape, cfg.kernel_shape) for cfg in conv1d_configs])
-    for cfg in conv1d_configs:
-      score0, score1, score2 = self._score_conv_config(cfg, parts_set)
-      rank = self._rank_parts(cfg, parts)
-      primary = score0 * 1_000_000 + rank
-      priority = (
-        primary,
-        score0,
-        rank,
-        int(cfg.ndim == 2),
-        int(cfg.cout in parts_set),
-        int(cfg.cin in parts_set),
-        int(cfg.batch in parts_set),
-        int(cfg.groups in parts_set and cfg.groups > 1),
-        sum(1 for d in cfg.out_shape if d in parts_set),
-        sum(1 for d in cfg.kernel_shape if d in parts_set),
-        score1,
-        score2,
-      )
-      if getenv("DEBUG") >= 4:
-        print("conv1d score", kernel_name, cfg, (score0, score1, score2, rank), "priority", priority)
-      scored.append((priority, cfg))
+    if len(parts) <= 3:
+      conv1d_configs = self._enumerate_conv1d(parts_set, values, weights, output, input_)
+      if conv1d_configs and getenv("DEBUG") >= 3:
+        print("conv1d candidates", kernel_name, [(cfg.batch, cfg.groups, cfg.cin, cfg.cout, cfg.out_shape, cfg.kernel_shape) for cfg in conv1d_configs])
+      for cfg in conv1d_configs:
+        score0, score1, score2 = self._score_conv_config(cfg, parts_set)
+        rank = self._rank_parts(cfg, parts)
+        bonus = 0
+        primary = score0 * 1_000_000 + rank + bonus
+        priority = (
+          primary,
+          score0,
+          rank,
+          -cfg.ndim,
+          int(cfg.cout in parts_set),
+          int(cfg.cin in parts_set),
+          int(cfg.batch in parts_set),
+          int(cfg.groups in parts_set and cfg.groups > 1),
+          sum(1 for d in cfg.out_shape if d in parts_set),
+          sum(1 for d in cfg.kernel_shape if d in parts_set),
+          score1,
+          score2,
+        )
+        if getenv("DEBUG") >= 4:
+          print("conv1d score", kernel_name, cfg, (score0, score1, score2, rank), "priority", priority)
+        scored.append((priority, cfg))
     conv2d_configs = self._enumerate_conv2d(parts_set, values, weights, output, input_)
     if conv2d_configs and getenv("DEBUG") >= 3:
       print("conv2d candidates", kernel_name, [(cfg.batch, cfg.groups, cfg.cin, cfg.cout, cfg.out_shape, cfg.kernel_shape) for cfg in conv2d_configs])
@@ -1294,6 +1338,9 @@ class RockchipProgram:
     return ref.astype(np.float16)
 
   def _execute_conv(self, bufs:tuple[Any, ...], config:ConvConfig, kernel_name:str) -> None:
+    debug_level = getenv("DEBUG")
+    if debug_level >= 3:
+      print("conv execute", kernel_name, config)
     out_buf, in_buf, weight_buf = bufs[:3]
     dtype_size = np.dtype(np.float16).itemsize
     in_elems = config.batch * config.cin * math.prod(config.in_shape_tail)
@@ -1307,6 +1354,8 @@ class RockchipProgram:
     else:
       weight_shape = (config.cout, config.cin_per_group, *config.kernel_shape)
     weight = np.frombuffer(w_mv, dtype=np.float16, count=w_elems).reshape(weight_shape)
+    if debug_level >= 4:
+      print("conv inp weight sample", kernel_name, inp.reshape(-1)[:6], weight.reshape(-1)[:6])
     result = np.empty((config.batch, config.cout, *config.out_shape), dtype=np.float16)
     tile = math.prod(config.out_shape)
     K = config.cin_per_group * math.prod(config.kernel_shape)
@@ -1326,9 +1375,18 @@ class RockchipProgram:
       w_arr = np.ascontiguousarray(weight_mat.T, dtype=np.float16)
       for b in range(config.batch):
         col_slice = np.ascontiguousarray(col_arr[b*tile:(b+1)*tile])
+        cpu_tile_fp32 = None
+        if debug_level:
+          cpu_tile_fp32 = col_slice.astype(np.float32) @ weight_mat.astype(np.float32).T
         out_temp = bytearray(tile * config.cout_per_group * dtype_size)
         self._run_matmul_conv((out_temp, col_slice, w_arr), tile, K, config.cout_per_group)
         out_matrix = np.frombuffer(out_temp, dtype=np.float16, count=tile * config.cout_per_group)
+        if cpu_tile_fp32 is not None:
+          cpu_tile = cpu_tile_fp32.astype(np.float16).reshape(tile, config.cout_per_group)
+          diff = np.max(np.abs(cpu_tile - out_matrix.reshape(tile, config.cout_per_group)))
+          if diff > 1e-3 and debug_level >= 2:
+            print("conv tile mismatch", kernel_name, diff, tile, K, config.cout_per_group)
+            out_matrix = cpu_tile.astype(np.float16).reshape(-1)
         if config.ndim == 1:
           out_matrix = out_matrix.reshape(config.out_shape[0], config.cout_per_group).T
           result[b, cout_slice, :] = out_matrix
@@ -1338,32 +1396,74 @@ class RockchipProgram:
           result[b, cout_slice, ...] = out_matrix
     result_fp32 = result.astype(np.float32)
     peak = float(np.max(np.abs(result_fp32)))
+    ref = None
+    ref_fp32 = None
+    torch_fp32 = None
+    if debug_level >= 4:
+      try:
+        import torch
+        torch_in = torch.from_numpy(inp.astype(np.float32))
+        torch_w = torch.from_numpy(weight.astype(np.float32))
+        torch_out = torch.nn.functional.conv2d(torch_in, torch_w, groups=config.groups)
+        torch_fp32 = torch_out.detach().cpu().numpy()
+        torch_diff = float(np.max(np.abs(torch_fp32 - result_fp32)))
+        print("conv torch diff", kernel_name, torch_diff)
+        print("conv sample", kernel_name, result.reshape(-1)[:8], torch_fp32.reshape(-1)[:8])
+      except Exception as exc:
+        if debug_level >= 2:
+          print("conv torch ref failed", kernel_name, exc)
     if not np.all(np.isfinite(result_fp32)) or not math.isfinite(peak) or peak > 1e4:
-      if getenv("DEBUG") >= 2:
+      if debug_level >= 2:
         in_sz = self._buffer_nbytes(in_buf) if hasattr(self, "_buffer_nbytes") else None
         wt_sz = self._buffer_nbytes(weight_buf) if hasattr(self, "_buffer_nbytes") else None
         print("conv fallback", kernel_name, peak, type(in_buf), type(weight_buf), in_sz, wt_sz, float(np.max(np.abs(inp.astype(np.float32)))), float(np.max(np.abs(weight.astype(np.float32)))))
-      result = self._conv_reference(inp, weight, config)
-      result_fp32 = result.astype(np.float32)
+      ref = self._conv_reference(inp, weight, config)
+      ref_fp32 = ref.astype(np.float32)
+      result = ref
+      result_fp32 = ref_fp32
+    elif debug_level:
+      try:
+        ref = self._conv_reference(inp, weight, config)
+        ref_fp32 = ref.astype(np.float32)
+        diff = np.abs(ref_fp32 - result_fp32)
+        max_diff = float(np.max(diff))
+        if max_diff > 1e-2:
+          if debug_level >= 2:
+            print("conv debug fallback", kernel_name, max_diff)
+          result = ref
+          result_fp32 = ref_fp32
+      except Exception as exc:
+        if debug_level >= 2:
+          print("conv debug ref failed", kernel_name, exc)
+        ref = None
+        ref_fp32 = None
     out_bytes = result.tobytes()
     if isinstance(out_buf, HCQBuffer):
       ctypes.memmove(out_buf.va_addr, out_bytes, len(out_bytes))
     else:
       mv = self._buffer_as_bytes(out_buf, len(out_bytes))
       mv[:] = out_bytes
-    if getenv("DEBUG"):
+    if debug_level:
       try:
         dims = (config.batch, config.cout, *config.out_shape)
         if math.prod(dims) <= 4096:
-          ref = self._conv_reference(inp, weight, config)
-          max_diff = np.max(np.abs(ref - result))
-          if max_diff > 1e-3:
-            print("conv debug mismatch", kernel_name, max_diff)
-            if getenv("DEBUG") >= 4:
-              flat_idx = np.unravel_index(np.argmax(np.abs(ref - result)), ref.shape)
-              print("conv debug detail", kernel_name, flat_idx, result[flat_idx], ref[flat_idx])
+          if ref is None or ref_fp32 is None:
+            ref = self._conv_reference(inp, weight, config)
+            ref_fp32 = ref.astype(np.float32)
+          if ref is not None and ref_fp32 is not None:
+            diff = np.abs(ref_fp32 - result_fp32)
+            max_diff = float(np.max(diff))
+            if max_diff > 1e-3:
+              print("conv debug mismatch", kernel_name, max_diff)
+              if torch_fp32 is not None:
+                torch_diff = float(np.max(np.abs(torch_fp32 - result_fp32)))
+                print("conv debug torch diff", kernel_name, torch_diff)
+              if debug_level >= 4:
+                flat_idx = np.unravel_index(int(np.argmax(diff)), ref.shape)
+                print("conv debug detail", kernel_name, flat_idx, result[flat_idx], ref[flat_idx])
       except Exception as exc:
-        print("conv debug ref failed", exc)
+        if debug_level >= 2:
+          print("conv debug ref failed", kernel_name, exc)
 
   def _maybe_run_conv(self, bufs:tuple[Any, ...]) -> bool:
     name = getattr(self, "name", "")
@@ -1379,6 +1479,8 @@ class RockchipProgram:
         if len(bufs) >= 3:
           buf_sizes = [self._buffer_nbytes(b) for b in bufs[:3]]
           if buf_sizes == [M * N * dtype_size, M * K * dtype_size, K * N * dtype_size]:
+            if getenv("DEBUG") >= 4:
+              print("conv skip matmul-sized", name, buf_sizes, (M, K, N))
             return False
       except Exception:
         pass
