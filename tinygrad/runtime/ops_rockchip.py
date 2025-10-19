@@ -1057,38 +1057,64 @@ class RockchipProgram:
   def _score_conv_config(self, config:ConvConfig, parts_set:set[int]) -> tuple[int, int, int]:
     dims = [config.batch, config.groups, config.cout_per_group, config.cin_per_group, *config.out_shape, *config.kernel_shape]
     score = sum(1 for d in dims if d > 1 and d in parts_set)
-    return (score, config.ndim, len(config.out_shape))
+    if config.ndim == 2:
+      score += 1
+    out_prod = math.prod(config.out_shape)
+    if out_prod in parts_set:
+      score += 4
+    kernel_prod = math.prod(config.kernel_shape)
+    if kernel_prod in parts_set:
+      score += 2
+    return (score, -config.ndim, len(config.out_shape))
 
   def _rank_parts(self, config:ConvConfig, parts:list[int]) -> int:
-    out_tile = math.prod(config.out_shape)
-    kernel_tile = math.prod(config.kernel_shape)
-    rank = out_tile * 10_000 + kernel_tile * 1_000
-    if not parts: return rank
-    out_dims = list(config.out_shape)
-    if config.ndim == 1: out_main = out_dims[0]
-    else: out_main = out_dims[0]
-    kernel_dims = list(config.kernel_shape)
-    kernel_main = kernel_dims[0]
-    cin_total = config.cin
-    if len(parts) >= 4:
-      if parts[0] == config.batch: rank += 150
-      if parts[1] == config.cout: rank += 140
-      if parts[2] == out_main: rank += 130
-      expected_last = kernel_main if kernel_main != 1 else cin_total
-      if parts[3] == expected_last: rank += 90
-    elif len(parts) == 3:
-      if parts[0] == config.batch: rank += 150
-      if parts[1] == config.cout: rank += 140
-      if parts[2] == out_main: rank += 130
-    elif len(parts) == 2:
-      if parts[0] == config.cout: rank += 120
-      if parts[1] == out_main: rank += 110
-    elif len(parts) == 1:
-      if parts[0] == config.cout: rank += 100
+    if not parts:
+      return 0
+    rank = 0
+    parts_set = set(parts)
+    rank += math.prod(config.out_shape) * 100
+    rank += math.prod(config.kernel_shape) * 10
+    def add(cond:bool, value:int) -> None:
+      nonlocal rank
+      if cond: rank += value
+    if config.ndim == 1:
+      if len(parts) >= 1:
+        add(parts[0] == config.batch, 900)
+        add(parts[0] == config.cout, 600)
+      if len(parts) >= 2:
+        add(parts[1] == config.cout, 700)
+        add(parts[1] == config.out_shape[0], 500)
+      if len(parts) >= 3:
+        add(parts[2] == config.out_shape[0], 550)
+        add(parts[2] in (config.cin, config.kernel_shape[0], config.cin_per_group), 400)
+      if len(parts) >= 4: add(parts[3] == config.kernel_shape[0], 350)
+    else:
+      if len(parts) >= 1:
+        add(parts[0] == config.batch, 950)
+        add(parts[0] == config.cout, 700)
+      if len(parts) >= 2:
+        add(parts[1] == config.cout, 750)
+        add(parts[1] == config.out_shape[0], 650)
+      if len(parts) >= 3:
+        add(parts[2] == config.out_shape[0], 620)
+        add(parts[2] == config.out_shape[1], 600)
+      if len(parts) >= 4: add(parts[3] in (config.cin, config.cin_per_group, config.groups), 550)
+      if len(parts) >= 5: add(parts[4] == config.kernel_shape[0], 500)
+      if len(parts) >= 6: add(parts[5] == config.kernel_shape[1], 450)
+      if config.out_shape[0] <= config.out_shape[1]: rank += 500
+      else: rank -= 250
+      if config.in_shape_tail[0] <= config.in_shape_tail[1]: rank += 400
+      else: rank -= 200
     attr_matches = {config.batch, config.cout, config.cin, config.groups,
                     *config.out_shape, *config.kernel_shape,
                     config.cout_per_group, config.cin_per_group}
-    rank += sum(5 for p in parts if p in attr_matches)
+    rank += sum(25 for p in parts if p in attr_matches)
+    if config.groups > 1 and config.groups in parts_set:
+      rank += 800
+    if config.cin_per_group != config.cin and config.cin_per_group in parts_set:
+      rank += 450
+    if config.cout_per_group != config.cout and config.cout_per_group in parts_set:
+      rank += 450
     return rank
 
   def _enumerate_conv1d(self, parts_set:set[int], values:set[int], weights:int, output:int, input_:int) -> list[ConvConfig]:
@@ -1132,12 +1158,10 @@ class RockchipProgram:
       if G <= 0: continue
       for kH in _divisors(weights):
         if kH <= 0: continue
-        if kH not in parts_set and kH != 1: continue
         if weights % kH != 0: continue
         remaining_for_kw = weights // kH
         for kW in _divisors(remaining_for_kw):
           if kW <= 0: continue
-          if kW not in parts_set and kW != 1: continue
           kernel_prod = kH * kW
           if kernel_prod == 0 or weights % kernel_prod != 0: continue
           leftover = weights // kernel_prod
@@ -1160,8 +1184,6 @@ class RockchipProgram:
                 if Hout <= 0: continue
                 Wout = rem // Hout
                 if Wout <= 0: continue
-                if Hout not in parts_set and Hout != 1: continue
-                if Wout not in parts_set and Wout != 1: continue
                 Hin = Hout + kH - 1
                 Win = Wout + kW - 1
                 if Hin <= 0 or Win <= 0: continue
@@ -1189,18 +1211,56 @@ class RockchipProgram:
     if weights <= 0 or output <= 0 or input_ <= 0: return None
     parts_set = set(parts)
     values = parts_set | {1}
+    scored:list[tuple[tuple[int, int, int, int], ConvConfig]] = []
     conv1d_configs = self._enumerate_conv1d(parts_set, values, weights, output, input_)
-    if conv1d_configs:
-      if getenv("DEBUG") >= 3:
-        print("conv1d candidates", kernel_name, [(cfg.batch, cfg.groups, cfg.cin, cfg.cout, cfg.out_shape, cfg.kernel_shape) for cfg in conv1d_configs])
-      scored_1d = [((*self._score_conv_config(cfg, parts_set), self._rank_parts(cfg, parts)), cfg) for cfg in conv1d_configs]
-      scored_1d.sort()
-      return scored_1d[-1][1]
+    if conv1d_configs and getenv("DEBUG") >= 3:
+      print("conv1d candidates", kernel_name, [(cfg.batch, cfg.groups, cfg.cin, cfg.cout, cfg.out_shape, cfg.kernel_shape) for cfg in conv1d_configs])
+    for cfg in conv1d_configs:
+      score0, score1, score2 = self._score_conv_config(cfg, parts_set)
+      rank = self._rank_parts(cfg, parts)
+      primary = score0 * 10000 + rank
+      priority = (
+        primary,
+        score0,
+        int(cfg.ndim == 2),
+        int(cfg.cout in parts_set),
+        int(cfg.cin in parts_set),
+        int(cfg.batch in parts_set),
+        int(cfg.groups in parts_set and cfg.groups > 1),
+        sum(1 for d in cfg.out_shape if d in parts_set),
+        sum(1 for d in cfg.kernel_shape if d in parts_set),
+        score1,
+        score2,
+      )
+      if getenv("DEBUG") >= 4:
+        print("conv1d score", kernel_name, cfg, (score0, score1, score2, rank), "priority", priority)
+      scored.append((priority, cfg))
     conv2d_configs = self._enumerate_conv2d(parts_set, values, weights, output, input_)
-    if conv2d_configs:
-      scored_2d = [((*self._score_conv_config(cfg, parts_set), self._rank_parts(cfg, parts)), cfg) for cfg in conv2d_configs]
-      scored_2d.sort()
-      return scored_2d[-1][1]
+    if conv2d_configs and getenv("DEBUG") >= 3:
+      print("conv2d candidates", kernel_name, [(cfg.batch, cfg.groups, cfg.cin, cfg.cout, cfg.out_shape, cfg.kernel_shape) for cfg in conv2d_configs])
+    for cfg in conv2d_configs:
+      score0, score1, score2 = self._score_conv_config(cfg, parts_set)
+      rank = self._rank_parts(cfg, parts)
+      primary = score0 * 10000 + rank
+      priority = (
+        primary,
+        score0,
+        int(cfg.ndim == 2),
+        int(cfg.cout in parts_set),
+        int(cfg.cin in parts_set),
+        int(cfg.batch in parts_set),
+        int(cfg.groups in parts_set and cfg.groups > 1),
+        sum(1 for d in cfg.out_shape if d in parts_set),
+        sum(1 for d in cfg.kernel_shape if d in parts_set),
+        score1,
+        score2,
+      )
+      if getenv("DEBUG") >= 4:
+        print("conv2d score", kernel_name, cfg, (score0, score1, score2, rank), "priority", priority)
+      scored.append((priority, cfg))
+    if scored:
+      scored.sort()
+      return scored[-1][1]
     config = self._parse_conv1d_from_name(parts, buf_sizes)
     if config is not None: return config
     config = self._parse_conv2d_from_name(parts, buf_sizes)
@@ -1239,7 +1299,7 @@ class RockchipProgram:
       weight_mat = weight_group.reshape(config.cout_per_group, K)
       w_arr = np.ascontiguousarray(weight_mat.T, dtype=np.float16)
       for b in range(config.batch):
-        col_slice = col_arr[b*tile:(b+1)*tile]
+        col_slice = np.ascontiguousarray(col_arr[b*tile:(b+1)*tile])
         out_temp = bytearray(tile * config.cout_per_group * dtype_size)
         self._run_matmul_conv((out_temp, col_slice, w_arr), tile, K, config.cout_per_group)
         out_matrix = np.frombuffer(out_temp, dtype=np.float16, count=tile * config.cout_per_group)
@@ -1284,6 +1344,9 @@ class RockchipProgram:
           max_diff = np.max(np.abs(ref - result))
           if max_diff > 1e-3:
             print("conv debug mismatch", kernel_name, max_diff)
+            if getenv("DEBUG") >= 4:
+              flat_idx = np.unravel_index(np.argmax(np.abs(ref - result)), ref.shape)
+              print("conv debug detail", kernel_name, flat_idx, result[flat_idx], ref[flat_idx])
       except Exception as exc:
         print("conv debug ref failed", exc)
 
