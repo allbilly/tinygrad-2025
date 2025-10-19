@@ -79,6 +79,8 @@ class ConvConfig(NamedTuple):
   out_shape: tuple[int, ...]
   kernel_shape: tuple[int, ...]
   in_shape_tail: tuple[int, ...]
+  strides: tuple[int, ...]
+  padding: tuple[int, ...]
 
 
 def _align_up(value:int, align:int) -> int:
