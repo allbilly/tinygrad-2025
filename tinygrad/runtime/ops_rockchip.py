@@ -1279,7 +1279,7 @@ class RockchipProgram:
             Cin = Cin_per_group * G
             Cout_per_group = Cout // G
             if Cout_per_group <= 0: continue
-            if G > 1 and Cout_per_group not in parts_set: continue
+            if G > 1 and Cout_per_group not in parts_set and Cout_per_group != 1: continue
             if Cin_per_group not in parts_set and Cin_per_group != 1: continue
             for N in _divisors(output):
               if N <= 0: continue
