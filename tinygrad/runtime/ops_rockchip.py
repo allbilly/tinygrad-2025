@@ -81,6 +81,7 @@ class ConvConfig(NamedTuple):
   in_shape_tail: tuple[int, ...]
   strides: tuple[int, ...]
   padding: tuple[int, ...]
+  dilation: tuple[int, ...] | None = None
 
 
 def _align_up(value:int, align:int) -> int:
@@ -1287,28 +1288,53 @@ class RockchipProgram:
               if denom == 0 or output % denom != 0: continue
               rem = output // denom
               if rem <= 0: continue
+              if input_ % (N * Cin) != 0: continue
+              actual_spatial = input_ // (N * Cin)
+              if actual_spatial <= 0: continue
+              actual_h_candidates = _divisors(actual_spatial)
               for Hout in _divisors(rem):
                 if Hout <= 0: continue
                 Wout = rem // Hout
                 if Wout <= 0: continue
-                Hin = Hout + kH - 1
-                Win = Wout + kW - 1
-                if Hin <= 0 or Win <= 0: continue
-                if input_ != N * Cin * Hin * Win: continue
-                configs.append(ConvConfig(
-                  ndim=2,
-                  batch=N,
-                  groups=G,
-                  cin=Cin,
-                  cout=Cout,
-                  cin_per_group=Cin_per_group,
-                  cout_per_group=Cout_per_group,
-                  out_shape=(Hout, Wout),
-                  kernel_shape=(kH, kW),
-                  in_shape_tail=(Hin, Win),
-                  strides=(1, 1),  # Default stride of 1
-                  padding=(0, 0),  # Default padding of 0
-                ))
+                for Hin_actual in actual_h_candidates:
+                  Win_actual = actual_spatial // Hin_actual
+                  if Win_actual <= 0: continue
+                  # infer dilation along height
+                  if kH > 1:
+                    numer_h = Hin_actual - Hout
+                    if numer_h < 0 or numer_h % (kH - 1) != 0: continue
+                    dil_h = numer_h // (kH - 1)
+                    if dil_h <= 0: continue
+                  else:
+                    if Hin_actual != Hout: continue
+                    dil_h = 1
+                  # infer dilation along width
+                  if kW > 1:
+                    numer_w = Win_actual - Wout
+                    if numer_w < 0 or numer_w % (kW - 1) != 0: continue
+                    dil_w = numer_w // (kW - 1)
+                    if dil_w <= 0: continue
+                  else:
+                    if Win_actual != Wout: continue
+                    dil_w = 1
+                  # verify forward formula with stride=1, padding=0
+                  if Hout != Hin_actual - (kH - 1) * dil_h: continue
+                  if Wout != Win_actual - (kW - 1) * dil_w: continue
+                  configs.append(ConvConfig(
+                    ndim=2,
+                    batch=N,
+                    groups=G,
+                    cin=Cin,
+                    cout=Cout,
+                    cin_per_group=Cin_per_group,
+                    cout_per_group=Cout_per_group,
+                    out_shape=(Hout, Wout),
+                    kernel_shape=(kH, kW),
+                    in_shape_tail=(Hin_actual, Win_actual),
+                    strides=(1, 1),
+                    padding=(0, 0),
+                    dilation=(dil_h, dil_w),
+                  ))
     return configs
 
   def _infer_conv_config(self, parts:list[int], buf_sizes:list[int], kernel_name:str) -> ConvConfig|None:
@@ -1399,6 +1425,8 @@ class RockchipProgram:
     input_size = buf_sizes[1] // 2  # in half precision bytes
     expected_unpadded_input = config.batch * config.cin * math.prod(config.in_shape_tail)
     
+    dilation = config.dilation if config.dilation else (1,) * config.ndim
+
     if config.ndim == 1:
       # For 1D convolution, try to calculate if there's padding
       if input_size > expected_unpadded_input:
@@ -1417,6 +1445,16 @@ class RockchipProgram:
       else:
         padding = (0,)
         strides = (1,)
+
+      k = config.kernel_shape[0]
+      if k > 1:
+        numerator = config.in_shape_tail[0] + 2 * padding[0] - (config.out_shape[0] - 1) * strides[0] - 1
+        if numerator >= 0 and numerator % (k - 1) == 0:
+          dilation = (max(1, numerator // (k - 1)),)
+        else:
+          dilation = (1,)
+      else:
+        dilation = (1,)
     else:  # 2D convolution
       # For 2D convolution
       actual_total_elements = input_size
@@ -1460,6 +1498,18 @@ class RockchipProgram:
       
       strides = (inferred_stride_h, inferred_stride_w)
 
+      dil_h = 1
+      dil_w = 1
+      if config.kernel_shape[0] > 1:
+        numerator_h = config.in_shape_tail[0] + 2 * padding[0] - (config.out_shape[0] - 1) * strides[0] - 1
+        if numerator_h >= 0 and numerator_h % (config.kernel_shape[0] - 1) == 0:
+          dil_h = max(1, numerator_h // (config.kernel_shape[0] - 1))
+      if config.kernel_shape[1] > 1:
+        numerator_w = config.in_shape_tail[1] + 2 * padding[1] - (config.out_shape[1] - 1) * strides[1] - 1
+        if numerator_w >= 0 and numerator_w % (config.kernel_shape[1] - 1) == 0:
+          dil_w = max(1, numerator_w // (config.kernel_shape[1] - 1))
+      dilation = (dil_h, dil_w)
+
     # Update the config with proper padding and strides
     return ConvConfig(
       ndim=config.ndim,
@@ -1473,13 +1523,15 @@ class RockchipProgram:
       kernel_shape=config.kernel_shape,
       in_shape_tail=config.in_shape_tail,
       strides=strides,
-      padding=padding
+      padding=padding,
+      dilation=dilation
     )
 
   def _conv_reference(self, inp:np.ndarray, weight:np.ndarray, config:ConvConfig) -> np.ndarray:
     # Get stride and padding, default to (1,) or (0,) if not specified
     strides = config.strides if config.strides else (1,) * config.ndim
     padding = config.padding if config.padding else (0,) * config.ndim
+    dilation = config.dilation if config.dilation else (1,) * config.ndim
     
     ref = np.zeros((config.batch, config.cout, *config.out_shape), dtype=np.float32)
     for b in range(config.batch):
@@ -1506,18 +1558,20 @@ class RockchipProgram:
         else:
           pad_h, pad_w = (padding[0], padding[1]) if len(padding) >= 2 else (0, 0)
           stride_h, stride_w = (strides[0], strides[1]) if len(strides) >= 2 else (1, 1)
-          
+          dil_h, dil_w = (dilation[0], dilation[1]) if len(dilation) >= 2 else (1, 1)
+
           # Pad the input group
           inp_padded = np.pad(inp_group, ((0, 0), (pad_h, pad_h), (pad_w, pad_w)), mode='constant', constant_values=0)
-          
+
           for co in range(config.cout_per_group):
             for y in range(config.out_shape[0]):
               for x in range(config.out_shape[1]):
                 start_y = y * stride_h
                 start_x = x * stride_w
-                ref[b, cout_slice.start + co, y, x] = np.sum(
-                  inp_padded[:, start_y:start_y+config.kernel_shape[0], start_x:start_x+config.kernel_shape[1]] * w_group[co]
-                )
+                end_y = start_y + (config.kernel_shape[0]-1) * dil_h + 1
+                end_x = start_x + (config.kernel_shape[1]-1) * dil_w + 1
+                window = inp_padded[:, start_y:end_y:dil_h, start_x:end_x:dil_w]
+                ref[b, cout_slice.start + co, y, x] = np.sum(window * w_group[co])
     return ref.astype(np.float16)
 
   def _execute_conv(self, bufs:tuple[Any, ...], config:ConvConfig, kernel_name:str) -> None:
@@ -1564,7 +1618,14 @@ class RockchipProgram:
       else:
         # For 2D, extract sliding windows of kernel shape from the padded input
         # The inp_group should already include the padding, so we extract windows normally
-        windows = np.lib.stride_tricks.sliding_window_view(inp_group, window_shape=config.kernel_shape, axis=(-2, -1))
+        dil_h, dil_w = config.dilation if config.dilation else (1, 1)
+        if dil_h > 1 or dil_w > 1:
+          eff_h = (config.kernel_shape[0]-1) * dil_h + 1
+          eff_w = (config.kernel_shape[1]-1) * dil_w + 1
+          windows = np.lib.stride_tricks.sliding_window_view(inp_group, window_shape=(eff_h, eff_w), axis=(-2, -1))
+          windows = windows[..., ::dil_h, ::dil_w]
+        else:
+          windows = np.lib.stride_tricks.sliding_window_view(inp_group, window_shape=config.kernel_shape, axis=(-2, -1))
         stride_h, stride_w = config.strides if config.strides else (1, 1)
         if stride_h > 1 or stride_w > 1:
           # Apply stride to the sliding windows to match convolution stride
