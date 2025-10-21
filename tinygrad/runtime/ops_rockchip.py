@@ -83,6 +83,26 @@ class ConvConfig(NamedTuple):
   padding: tuple[int, ...]
   dilation: tuple[int, ...] | None = None
 
+  @property
+  def spatial_dims(self) -> tuple[int, ...]:
+    return self.out_shape
+
+  @property
+  def kernel_dims(self) -> tuple[int, ...]:
+    return self.kernel_shape
+
+  @property
+  def stride_dims(self) -> tuple[int, ...]:
+    return self.strides if self.strides else (1,) * self.ndim
+
+  @property
+  def pad_dims(self) -> tuple[int, ...]:
+    return self.padding if self.padding else (0,) * self.ndim
+
+  @property
+  def dilation_dims(self) -> tuple[int, ...]:
+    return self.dilation if self.dilation else (1,) * self.ndim
+
 
 def _align_up(value:int, align:int) -> int:
   return (value + align - 1) // align * align
@@ -1780,9 +1800,77 @@ class RockchipProgram:
     config = self._infer_conv_config(parts, buf_sizes, name)
     if config is None:
       return False
+    try:
+      if self._execute_direct_conv_1x1(bufs, config, name):
+        if getenv("DEBUG") >= 3:
+          print("conv handled direct", name, config)
+        return True
+    except Exception as exc:
+      if getenv("DEBUG"):
+        print("direct conv path failed", name, exc)
     self._execute_conv(bufs, config, name)
     if getenv("DEBUG") >= 3:
       print("conv handled", name, config)
+    return True
+
+  def _can_use_direct_conv_1x1(self, bufs:tuple[Any, ...], config:ConvConfig) -> bool:
+    if config.ndim != 2: return False
+    if config.kernel_dims != (1, 1): return False
+    if config.groups != 1: return False
+    if any(s != 1 for s in config.stride_dims): return False
+    if any(p != 0 for p in config.pad_dims): return False
+    if any(d != 1 for d in config.dilation_dims): return False
+    if len(bufs) < 3: return False
+    if math.prod(config.kernel_dims) != 1: return False
+    # Ensure logical input spatial matches output for stride 1, pad 0
+    if config.in_shape_tail != config.out_shape:
+      return False
+    # Require float16 path for now
+    return True
+
+  def _execute_direct_conv_1x1(self, bufs:tuple[Any, ...], config:ConvConfig, kernel_name:str) -> bool:
+    if not self._can_use_direct_conv_1x1(bufs, config):
+      return False
+    out_buf, in_buf, weight_buf = bufs[:3]
+    dtype_size = np.dtype(np.float16).itemsize
+    in_elems = config.batch * config.cin * math.prod(config.in_shape_tail)
+    kernel_elems = config.cout * config.cin * math.prod(config.kernel_dims)
+    try:
+      in_mv = self._buffer_as_bytes(in_buf, in_elems * dtype_size)
+      w_mv = self._buffer_as_bytes(weight_buf, kernel_elems * dtype_size)
+    except Exception:
+      return False
+
+    inp = np.frombuffer(in_mv, dtype=np.float16, count=in_elems).reshape((config.batch, config.cin, *config.in_shape_tail))
+    weight = np.frombuffer(w_mv, dtype=np.float16, count=kernel_elems).reshape((config.cout, config.cin))
+
+    height, width = config.in_shape_tail
+    m = height * width
+    b_arr = np.ascontiguousarray(weight.T)
+    output_tensor = np.empty((config.batch, config.cout, height, width), dtype=np.float16)
+    tmp_buffer = bytearray(m * config.cout * dtype_size)
+
+    for b in range(config.batch):
+      input_matrix = inp[b].transpose(1, 2, 0).reshape(m, config.cin)
+      a_arr = np.ascontiguousarray(input_matrix)
+      self._run_matmul_conv((tmp_buffer, a_arr, b_arr), m, config.cin, config.cout)
+      out_matrix = np.frombuffer(tmp_buffer, dtype=np.float16, count=m * config.cout).reshape(m, config.cout)
+      output_tensor[b] = out_matrix.reshape(height, width, config.cout).transpose(2, 0, 1)
+
+    if len(bufs) >= 4:
+      try:
+        bias_mv = self._buffer_as_bytes(bufs[3], config.cout * dtype_size)
+        bias = np.frombuffer(bias_mv, dtype=np.float16, count=config.cout)
+        output_tensor += bias[:, None, None]
+      except Exception:
+        pass
+
+    out_bytes = output_tensor.astype(np.float16).tobytes()
+    if isinstance(out_buf, HCQBuffer):
+      ctypes.memmove(out_buf.va_addr, out_bytes, len(out_bytes))
+    else:
+      out_mv = self._buffer_as_bytes(out_buf, len(out_bytes))
+      out_mv[:] = out_bytes
     return True
 
   def _build_matmul_queue(self, Mpad:int, Kpad:int, Npad:int,
