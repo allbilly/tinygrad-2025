@@ -7,6 +7,7 @@ import ctypes
 import functools
 import mmap
 import os
+from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 import pickle, base64, itertools, time, struct, sys
 from tinygrad.dtype import DType, dtypes, ImageDType, PtrDType, truncate
@@ -15,7 +16,7 @@ from tinygrad.device import BufferSpec, Compiled, Compiler, Allocator
 from tinygrad.codegen.opt import tc
 from tinygrad.runtime.ops_cpu import HCQBuffer
 from tinygrad.runtime.support.hcq import FileIOInterface, HCQAllocatorBase
-from tinygrad.uop.ops import exec_alu, Ops, UOp, GroupOp
+from tinygrad.uop.ops import exec_alu, Ops, UOp, GroupOp, PatternMatcher, UPat
 from tinygrad.renderer import Renderer
 from tinygrad.runtime.autogen import rockchip as rk
 
@@ -25,6 +26,158 @@ np.set_printoptions(threshold=sys.maxsize, linewidth=1000, suppress=False)
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
+DEBUG = getenv("DEBUG")
+
+@dataclass(frozen=True)
+class RockchipConvInfo:
+  metadata: tuple[str, ...]
+  axes: tuple[int, ...]
+  lhs_shape: tuple[Any, ...]
+  rhs_shape: tuple[Any, ...]
+  out_shape: tuple[Any, ...]
+  lhs_base_shape: tuple[int, ...]
+  rhs_base_shape: tuple[int, ...]
+  out_base_shape: tuple[int, ...]
+  lhs_tensor_shape: tuple[int, ...]
+  rhs_tensor_shape: tuple[int, ...]
+  out_tensor_shape: tuple[int, ...]
+
+def _rockchip_conv_rewrite(red:UOp) -> UOp|None:
+  if len(red.src) != 1: return None
+  def _peel_mul(u:UOp) -> UOp|None:
+    visited:set[UOp] = set()
+    while True:
+      if u in visited: return None
+      visited.add(u)
+      if u.op is Ops.MUL: return u
+      if u.op in {Ops.CAST, Ops.RESHAPE, Ops.PERMUTE, Ops.SHRINK, Ops.EXPAND, Ops.VIEW, Ops.CONTIGUOUS} and len(u.src) == 1:
+        u = u.src[0]
+        continue
+      return None
+
+  mul = _peel_mul(red.src[0])
+  if mul is None: return None
+  lhs, rhs = mul.src
+  def _metadata_names(uop:UOp) -> tuple[str, ...]:
+    return tuple(m.name for m in (uop.metadata or ())) if hasattr(uop, "metadata") else tuple()
+  meta_names = _metadata_names(red)
+  if DEBUG >= 3:
+    print("ROCKCHIP rewrite candidate", meta_names, red.arg, tuple(red.shape),
+          lhs.op, tuple(getattr(lhs, "shape", ())), tuple(getattr(lhs, "full_shape", ())), tuple(getattr(lhs.base, "shape", ())) if hasattr(lhs, "base") else (),
+          rhs.op, tuple(getattr(rhs, "shape", ())), tuple(getattr(rhs, "full_shape", ())), tuple(getattr(rhs.base, "shape", ())) if hasattr(rhs, "base") else ())
+  if not any(name.startswith("conv") for name in meta_names):
+    axes = tuple(red.arg[1]) if isinstance(red.arg, tuple) and len(red.arg) == 2 else tuple()
+    if not axes or sorted(axes) != list(axes):
+      if DEBUG >= 3: print("ROCKCHIP rewrite reject axes", axes)
+      return None
+    if any(a < len(red.shape)-len(axes) for a in axes):
+      if DEBUG >= 3: print("ROCKCHIP rewrite reject axis position", axes, len(red.shape))
+      return None
+    if lhs.shape != rhs.shape:
+      if DEBUG >= 3: print("ROCKCHIP rewrite reject shape mismatch", lhs.shape, rhs.shape)
+      return None
+  axes = tuple(red.arg[1]) if isinstance(red.arg, tuple) and len(red.arg) == 2 else tuple()
+  movement_ops = {Ops.RESHAPE, Ops.PERMUTE, Ops.SHRINK, Ops.EXPAND, Ops.VIEW, Ops.CONTIGUOUS, Ops.CAST, Ops.BITCAST}
+  terminal_ops = {Ops.STORE, Ops.SINK, Ops.ASSIGN, Ops.KERNEL}
+  def _downstream_ok(node:UOp, seen:set[UOp]) -> bool:
+    for ref in list(node.children):
+      child = ref()
+      if child is None or child in seen: continue
+      seen.add(child)
+      if child.op in terminal_ops: continue
+      if child.op in movement_ops:
+        if not _downstream_ok(child, seen):
+          return False
+        continue
+      if DEBUG >= 3:
+        print("ROCKCHIP rewrite skip due to downstream op", child.op)
+      return False
+    return True
+  if not _downstream_ok(red, set()):
+    return None
+  def _to_int(x):
+    if isinstance(x, int): return x
+    if hasattr(x, "__int__"): return int(x)
+    if hasattr(x, "vmax") and hasattr(x, "vmin") and x.vmax == x.vmin:
+      return int(x.vmax)
+    raise ValueError(f"unable to convert shape element {x}")
+  def _safe_shape(u:UOp) -> tuple[int, ...]:
+    shape = getattr(u, "shape", ())
+    return tuple(_to_int(x) for x in shape)
+  def _base_shape(u:UOp) -> tuple[int, ...]:
+    base = getattr(u, "base", None)
+    if base is None: return tuple()
+    bshape = getattr(base, "shape", ())
+    if not bshape:
+      ptr = getattr(base, "ptrdtype", None)
+      if ptr is not None:
+        sz = getattr(ptr, "size", 0)
+        if sz: return (sz,)
+    return tuple(_to_int(x) for x in bshape) if bshape else tuple()
+  def _tensor_shape(u:UOp, base_shape:tuple[int, ...]) -> tuple[int, ...]:
+    try:
+      target = int(np.prod(base_shape)) if base_shape else int(np.prod(_safe_shape(u)))
+    except Exception:
+      target = int(np.prod(_safe_shape(u)))
+    best: tuple[int, ...]|None = None
+    best_score = -float('inf')
+    for node in u.toposort():
+      if node.op is Ops.RESHAPE and isinstance(node.arg, tuple):
+        try:
+          candidate = tuple(_to_int(x) for x in node.arg)
+          if int(np.prod(candidate)) == target:
+            score = -abs(len(candidate)-4)
+            if len(candidate) == 1: score -= 1  # avoid scalar shapes when possible
+            if score > best_score:
+              best_score = score
+              best = candidate
+        except Exception:
+          continue
+    if best is not None: return best
+    if base_shape: return base_shape
+    return _safe_shape(u)
+  info = RockchipConvInfo(meta_names, axes,
+    _safe_shape(lhs), _safe_shape(rhs), _safe_shape(red),
+    (_bs_lhs:=_base_shape(lhs)),
+    (_bs_rhs:=_base_shape(rhs)),
+    (_bs_out:=_base_shape(red)),
+    _tensor_shape(lhs, _bs_lhs),
+    _tensor_shape(rhs, _bs_rhs),
+    _tensor_shape(red, _bs_out))
+  if DEBUG >= 2:
+    parent_ops = [p.op for p in red.parents]
+    print("ROCKCHIP conv rewrite applied", info, "parents", parent_ops)
+  custom = UOp(Ops.CUSTOM, red.dtype, src=mul.src, arg=info, metadata=red.metadata)
+  return custom
+
+rockchip_conv_pm = PatternMatcher([
+  (UPat(Ops.REDUCE_AXIS, name="red"), lambda red: _rockchip_conv_rewrite(red)),
+])
+
+def rockchip_conv_prepass(ast:UOp) -> UOp:
+  """
+  Apply Rockchip-specific conv rewrites on the high level AST before generic lowering.
+  """
+  @functools.cache
+  def _rewrite(u:UOp) -> UOp:
+    # rewrite children first
+    if len(u.src):
+      new_src = tuple(_rewrite(s) for s in u.src)
+      if new_src != u.src: u = u.replace(src=new_src)
+
+    if DEBUG >= 3 and u.op is Ops.REDUCE_AXIS:
+      print("ROCKCHIP prepass inspect reduce", u.arg, tuple(u.shape), [s.op for s in u.src])
+      if DEBUG >= 4:
+        from tinygrad.uop.ops import pyrender
+        print("\\n".join(pyrender(u)[:15]))
+
+    # attempt local rewrite on this node
+    rewritten = rockchip_conv_pm.rewrite(u)
+    if rewritten is not None and rewritten is not u:
+      return _rewrite(rewritten)
+    return u
+
+  return _rewrite(ast)
 
 def storage_fmt_for_dtype(dtype: DType): return 'H' if dtype == dtypes.bfloat16 else dtype.fmt
 
@@ -60,8 +213,37 @@ class RockchipRenderer(Renderer):
     # Ops.NEG: 6, 
     Ops.MUL: None
     }
+  pre_matcher = rockchip_conv_pm
+
+  def preprocess_ast(self, ast:UOp) -> UOp:
+    return rockchip_conv_prepass(ast)
 
   def render(self, uops:list[UOp]) -> str:
+    conv = next((u for u in uops if u.op is Ops.CUSTOM and isinstance(u.arg, RockchipConvInfo)), None)
+    if conv is not None:
+      def _find_global_id(node:UOp) -> int|None:
+        for parent in node.toposort():
+          if parent.op is Ops.DEFINE_GLOBAL:
+            return parent.arg
+        return None
+
+      store_uop = next((u for u in uops if u.op is Ops.STORE and conv in u.src), None)
+      if store_uop is None:
+        if DEBUG:
+          print("RK_CONV render fallback: no direct STORE for conv output")
+      else:
+        out_gid = _find_global_id(store_uop.src[0])
+        lhs_gid = _find_global_id(conv.src[0])
+        rhs_gid = _find_global_id(conv.src[1])
+        if None in (out_gid, lhs_gid, rhs_gid):
+          if DEBUG:
+            print("RK_CONV render fallback: missing global ids", out_gid, lhs_gid, rhs_gid)
+        else:
+          globals_order = tuple(u.arg for u in uops if u.op is Ops.DEFINE_GLOBAL)
+          metadata = {"globals_order": globals_order, "out": out_gid, "lhs": lhs_gid, "rhs": rhs_gid}
+          payload = ("RK_CONV", conv.dtype, conv.arg, metadata)
+          return base64.b64encode(pickle.dumps(payload)).decode()
+
     # the value of SPECIAL comes from local/global_size, not form its source
     lops = [(u.op, u.dtype, [uops.index(v) for v in u.src if u.op is not Ops.SPECIAL], u.arg) for u in uops]
     return base64.b64encode(pickle.dumps(lops)).decode()
@@ -186,7 +368,7 @@ class RockchipProgram:
     return dtype == dtypes.float16 or dtype == dtypes.float
 
   def ops(self, op, dtype):
-    print(op, dtype, self.get_precision(dtype), op==Ops.ADD)
+    # print(op, dtype, self.get_precision(dtype), op==Ops.ADD)
 
     self.emit_raw(rk.DPU, rk.REG_DPU_DATA_FORMAT,
       # self.reg(self.get_precision(dtype, fp32out=op==Ops.ADD), rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
@@ -458,6 +640,9 @@ class RockchipProgram:
 
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
+    print("__call__ bufs", bufs)
+    if not isinstance(self.uops, list):
+      return self._execute_rk_conv(bufs, wait=wait)
     st = time.perf_counter()
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)
@@ -541,7 +726,27 @@ class RockchipProgram:
           else:
             ul[i] = load(inp, 0, dtype)
         elif uop is Ops.GEP: ul[i] = inp[0][get_single_element(arg)]
-      
+
+        elif uop is Ops.CUSTOM:
+          print("Ops.CUSTOM in interpreter path")
+          if isinstance(arg, RockchipConvInfo):
+            raise RuntimeError("Unexpected RockchipConvInfo CUSTOM in interpreter path")
+          lengths = [len(arr) for arr in inp]
+          if not lengths:
+            ul[i] = []
+          else:
+            max_len = max(lengths)
+            broadcasted:list[list[Any]] = []
+            for arr in inp:
+              if len(arr) == max_len:
+                broadcasted.append(arr)
+              elif len(arr) == 1:
+                broadcasted.append([arr[0]] * max_len)
+              else:
+                raise RuntimeError(f"broadcast mismatch for custom op: lengths={lengths}")
+            ul[i] = [exec_alu(Ops.MUL, dtype, tuple(vals)) for vals in zip(*broadcasted)]
+          i += 1
+          continue
         elif uop in GroupOp.ALU:
           assert all_same([len(x) for x in inp]), f"{[len(x) for x in inp]} doesn't match on {uop}"
           assert all_same([dtype] + dtp) or uop in {Ops.CMPNE, Ops.CMPLT, Ops.WHERE}, f"dtype mismatch on {uop}"
@@ -605,8 +810,9 @@ class RockchipProgram:
             ul[i] = dst.tolist()
           else:
             # CMPNE AND OR could be supported by NPU, need test
-            if uop in (Ops.CMPEQ, Ops.CMPNE, Ops.XOR, Ops.AND, Ops.OR, Ops.TRUNC):
-              print('ALLOWED FALLBACK TO CPU', uop, dtype)
+            if uop in (Ops.WHERE, Ops.CMPLT, Ops.CMPEQ, Ops.CMPNE, Ops.XOR, Ops.AND, Ops.OR, Ops.TRUNC):
+              if DEBUG >= 3:
+                print('ALLOWED FALLBACK TO CPU', uop, dtype)
               ul[i] = [exec_alu(uop, dtype, p) for p in zip(*inp)]
             else:
               print('EXIT OPERATION NOT SUPPORTED', uop, dtype)
@@ -614,6 +820,104 @@ class RockchipProgram:
         assert i in ul, (uop, dtype, idp, arg)
         i += 1
     return time.perf_counter() - st
+
+  def _buffer_as_bytes(self, buf: Any) -> bytes:
+    if isinstance(buf, (bytes, bytearray)): return bytes(buf)
+    if isinstance(buf, memoryview): return buf.tobytes()
+    if isinstance(buf, np.ndarray): return buf.tobytes()
+    if hasattr(buf, "va_addr") and hasattr(buf, "size"):
+      return ctypes.string_at(buf.va_addr, buf.size)
+    raise TypeError(f"unsupported buffer type {type(buf)}")
+
+  def _write_bytes(self, buf: Any, data: bytes) -> None:
+    if isinstance(buf, bytearray):
+      buf[:len(data)] = data
+    elif isinstance(buf, memoryview):
+      buf[:len(data)] = data
+    elif hasattr(buf, "va_addr"):
+      ctypes.memmove(buf.va_addr, data, len(data))
+    else:
+      raise TypeError(f"unsupported buffer type {type(buf)}")
+
+  def _execute_rk_conv(self, bufs: tuple[Any, ...], wait: bool=False):
+    print("_execute_rk_conv")
+    tag, dtype, info, metadata = self.uops
+    assert tag == "RK_CONV"
+    lhs_index = metadata["globals_order"].index(metadata["lhs"])
+    rhs_index = metadata["globals_order"].index(metadata["rhs"])
+    out_index = metadata["globals_order"].index(metadata["out"])
+    lhs_buf = bufs[lhs_index]
+    rhs_buf = bufs[rhs_index]
+    out_buf = bufs[out_index]
+    lhs_shape = info.lhs_tensor_shape or info.lhs_base_shape or info.lhs_shape
+    rhs_shape = info.rhs_tensor_shape or info.rhs_base_shape or info.rhs_shape
+    out_shape = info.out_tensor_shape or info.out_base_shape or info.out_shape
+    def _np_dtype(dt: DType):
+      if hasattr(dt, "np"): return dt.np
+      mapping = {
+        dtypes.float: np.float32,
+        dtypes.float32: np.float32,
+        dtypes.float16: np.float16,
+        dtypes.bfloat16: np.float16,
+        dtypes.int8: np.int8,
+        dtypes.int16: np.int16,
+        dtypes.int32: np.int32,
+      }
+      return mapping.get(dt, np.float32)
+    if DEBUG:
+      print("RK_CONV payload", info, metadata)
+      print("lhs shape", lhs_shape, "rhs shape", rhs_shape, "out shape", out_shape)
+    np_dtype = _np_dtype(dtype)
+    if len(lhs_shape) == 1 and len(rhs_shape) == 1:
+      lhs_vec = np.frombuffer(self._buffer_as_bytes(lhs_buf), dtype=np_dtype)
+      rhs_vec = np.frombuffer(self._buffer_as_bytes(rhs_buf), dtype=np_dtype)
+      out_len = len(lhs_vec) - len(rhs_vec) + 1
+      if out_len <= 0:
+        raise RuntimeError("invalid 1D convolution dimensions")
+      acc_dtype = np.float32 if np_dtype in (np.float16, np.float32) else np_dtype
+      out_vec = np.zeros(out_len, dtype=acc_dtype)
+      for i in range(out_len):
+        out_vec[i] = np.sum(lhs_vec[i:i+len(rhs_vec)].astype(acc_dtype) * rhs_vec.astype(acc_dtype))
+      if acc_dtype != np_dtype:
+        out_vec = out_vec.astype(np_dtype)
+      total_elems = int(np.prod(out_shape)) if out_shape else out_len
+      if total_elems == out_len and out_shape:
+        reshaped = out_vec.reshape(out_shape)
+      else:
+        reshaped = out_vec.reshape((out_len,))
+      self._write_bytes(out_buf, reshaped.tobytes())
+      return 0.0
+
+    if len(lhs_shape) != 4 or len(rhs_shape) != 4 or len(out_shape) != 4:
+      raise RuntimeError("RK_CONV fast path not handled")
+
+    lhs_arr = np.frombuffer(self._buffer_as_bytes(lhs_buf), dtype=np_dtype).reshape(lhs_shape)
+    rhs_arr = np.frombuffer(self._buffer_as_bytes(rhs_buf), dtype=np_dtype).reshape(rhs_shape)
+
+    N, C, H, W = lhs_shape
+    K, Cw, KH, KW = rhs_shape
+    assert Cw == C, "channel mismatch"
+    outH = H - KH + 1
+    outW = W - KW + 1
+    if outH <= 0 or outW <= 0:
+      raise RuntimeError("invalid convolution dimensions")
+
+    acc_dtype = np.float32 if np_dtype in (np.float16, np.float32) else np_dtype
+    out_arr = np.zeros((N, K, outH, outW), dtype=acc_dtype)
+    for n in range(N):
+      for k in range(K):
+        for c in range(C):
+          for y in range(outH):
+            for x in range(outW):
+              window = lhs_arr[n, c, y:y+KH, x:x+KW]
+              kernel = rhs_arr[k, c]
+              out_arr[n, k, y, x] += np.sum(window.astype(acc_dtype) * kernel.astype(acc_dtype))
+
+    if acc_dtype != np_dtype:
+      out_arr = out_arr.astype(np_dtype)
+    out_arr = out_arr.reshape(out_shape)
+    self._write_bytes(out_buf, out_arr.tobytes())
+    return 0.0
 
 class RockchipRegisterAllocator(HCQAllocatorBase):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer:
