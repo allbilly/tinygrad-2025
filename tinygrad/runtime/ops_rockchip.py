@@ -27,6 +27,7 @@ import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 DEBUG = getenv("DEBUG")
+FUSE_POSTOPS = getenv("ROCKCHIP_FUSE_POSTOPS", 1)
 
 @dataclass(frozen=True)
 class RockchipConvInfo:
@@ -41,6 +42,7 @@ class RockchipConvInfo:
   lhs_tensor_shape: tuple[int, ...]
   rhs_tensor_shape: tuple[int, ...]
   out_tensor_shape: tuple[int, ...]
+  post_ops: tuple[tuple[Ops, Any], ...] = ()
 
 def _rockchip_conv_rewrite(red:UOp) -> UOp|None:
   if len(red.src) != 1: return None
@@ -136,6 +138,62 @@ def _rockchip_conv_rewrite(red:UOp) -> UOp|None:
     if best is not None: return best
     if base_shape: return base_shape
     return _safe_shape(u)
+  movement_ops = {Ops.RESHAPE, Ops.PERMUTE, Ops.SHRINK, Ops.EXPAND, Ops.VIEW, Ops.CONTIGUOUS, Ops.CAST, Ops.BITCAST}
+  terminal_ops = {Ops.STORE, Ops.SINK, Ops.ASSIGN, Ops.KERNEL}
+  fusible_ops = {Ops.ADD} if FUSE_POSTOPS else set()
+
+  def _extract_const(node:UOp) -> Any|None:
+    cur = node
+    seen:set[UOp] = set()
+    while True:
+      if cur in seen: return None
+      seen.add(cur)
+      if cur.op is Ops.CONST: return cur.arg
+      if cur.op in movement_ops and len(cur.src) == 1:
+        cur = cur.src[0]
+        continue
+      return None
+
+  def _downstream_info(root:UOp) -> tuple[bool, list[tuple[Ops, Any]]]:
+    post:list[tuple[Ops, Any]] = []
+    seen:set[UOp] = set()
+    stack:list[UOp] = [root]
+    while stack:
+      node = stack.pop()
+      for ref in list(node.children):
+        child = ref()
+        if child is None or child in seen: continue
+        seen.add(child)
+        if DEBUG >= 3:
+          print("ROCKCHIP downstream inspect", node.op, "->", child.op)
+        if child.op in movement_ops:
+          stack.append(child)
+          continue
+        if child.op in fusible_ops:
+          const_operand:UOp|None = None
+          conv_operand:UOp|None = None
+          for src in child.src:
+            if src is root or root in src.parents:
+              conv_operand = src
+            else:
+              const_operand = src
+          if FUSE_POSTOPS and conv_operand is not None and const_operand is not None:
+            const_val = _extract_const(const_operand)
+            if const_val is None:
+              return False, []
+            post.append((child.op, const_val))
+            stack.append(child)
+            continue
+          return False, []
+        if child.op in terminal_ops:
+          continue
+        return False, []
+    return True, post
+
+  ok, post_ops = _downstream_info(red)
+  if not ok:
+    return None
+
   info = RockchipConvInfo(meta_names, axes,
     _safe_shape(lhs), _safe_shape(rhs), _safe_shape(red),
     (_bs_lhs:=_base_shape(lhs)),
@@ -143,7 +201,8 @@ def _rockchip_conv_rewrite(red:UOp) -> UOp|None:
     (_bs_out:=_base_shape(red)),
     _tensor_shape(lhs, _bs_lhs),
     _tensor_shape(rhs, _bs_rhs),
-    _tensor_shape(red, _bs_out))
+    _tensor_shape(red, _bs_out),
+    tuple(post_ops))
   if DEBUG >= 2:
     parent_ops = [p.op for p in red.parents]
     print("ROCKCHIP conv rewrite applied", info, "parents", parent_ops)
@@ -227,7 +286,7 @@ class RockchipRenderer(Renderer):
             return parent.arg
         return None
 
-      store_uop = next((u for u in uops if u.op is Ops.STORE and conv in u.src), None)
+      store_uop = next((u for u in uops if u.op is Ops.STORE and (conv in u.src or conv in u.parents)), None)
       if store_uop is None:
         if DEBUG:
           print("RK_CONV render fallback: no direct STORE for conv output")
@@ -631,17 +690,25 @@ class RockchipProgram:
     )
 
   def __init__(self, dev:RockchipDevice, name:str, lib:bytes):
-    self.uops: list[tuple[Ops, DType|None, list[int], Any]] = pickle.loads(lib)
+    loaded = pickle.loads(lib)
+    if isinstance(loaded, list):
+      self.uops: list[tuple[Ops, DType|None, list[int], Any]] = loaded
+      self._rk_conv_payload: tuple[Any, ...]|None = None
+      if DEBUG >= 3:
+        print("RockchipProgram uops sample", self.uops[:15])
+    else:
+      self.uops = []
+      self._rk_conv_payload = loaded
     self.device = dev
     self.q = []
     self.code_for_op = RockchipRenderer.code_for_op
-    print('enter init')
+    if DEBUG >= 3:
+      print("RockchipProgram init payload", type(loaded))
 
 
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
-    print("__call__ bufs", bufs)
-    if not isinstance(self.uops, list):
+    if self._rk_conv_payload is not None:
       return self._execute_rk_conv(bufs, wait=wait)
     st = time.perf_counter()
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
@@ -840,8 +907,8 @@ class RockchipProgram:
       raise TypeError(f"unsupported buffer type {type(buf)}")
 
   def _execute_rk_conv(self, bufs: tuple[Any, ...], wait: bool=False):
-    print("_execute_rk_conv")
-    tag, dtype, info, metadata = self.uops
+    assert self._rk_conv_payload is not None
+    tag, dtype, info, metadata = self._rk_conv_payload
     assert tag == "RK_CONV"
     lhs_index = metadata["globals_order"].index(metadata["lhs"])
     rhs_index = metadata["globals_order"].index(metadata["rhs"])
@@ -868,6 +935,17 @@ class RockchipProgram:
       print("RK_CONV payload", info, metadata)
       print("lhs shape", lhs_shape, "rhs shape", rhs_shape, "out shape", out_shape)
     np_dtype = _np_dtype(dtype)
+    post_ops = info.post_ops
+
+    def _apply_post_ops(arr: np.ndarray, work_dtype: np.dtype) -> np.ndarray:
+      result = arr
+      for op, value in post_ops:
+        if op is Ops.ADD:
+          result = result + np.array(value, dtype=work_dtype)
+        else:
+          raise RuntimeError(f"Unsupported RK_CONV post-op: {op}")
+      return result
+
     if len(lhs_shape) == 1 and len(rhs_shape) == 1:
       lhs_vec = np.frombuffer(self._buffer_as_bytes(lhs_buf), dtype=np_dtype)
       rhs_vec = np.frombuffer(self._buffer_as_bytes(rhs_buf), dtype=np_dtype)
@@ -878,6 +956,8 @@ class RockchipProgram:
       out_vec = np.zeros(out_len, dtype=acc_dtype)
       for i in range(out_len):
         out_vec[i] = np.sum(lhs_vec[i:i+len(rhs_vec)].astype(acc_dtype) * rhs_vec.astype(acc_dtype))
+      if post_ops:
+        out_vec = _apply_post_ops(out_vec, acc_dtype)
       if acc_dtype != np_dtype:
         out_vec = out_vec.astype(np_dtype)
       total_elems = int(np.prod(out_shape)) if out_shape else out_len
@@ -912,6 +992,9 @@ class RockchipProgram:
               window = lhs_arr[n, c, y:y+KH, x:x+KW]
               kernel = rhs_arr[k, c]
               out_arr[n, k, y, x] += np.sum(window.astype(acc_dtype) * kernel.astype(acc_dtype))
+
+    if post_ops:
+      out_arr = _apply_post_ops(out_arr, acc_dtype)
 
     if acc_dtype != np_dtype:
       out_arr = out_arr.astype(np_dtype)
