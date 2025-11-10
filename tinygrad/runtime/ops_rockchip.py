@@ -67,6 +67,11 @@ def _rockchip_conv_rewrite(red:UOp) -> UOp|None:
     print("ROCKCHIP rewrite candidate", meta_names, red.arg, tuple(red.shape),
           lhs.op, tuple(getattr(lhs, "shape", ())), tuple(getattr(lhs, "full_shape", ())), tuple(getattr(lhs.base, "shape", ())) if hasattr(lhs, "base") else (),
           rhs.op, tuple(getattr(rhs, "shape", ())), tuple(getattr(rhs, "full_shape", ())), tuple(getattr(rhs.base, "shape", ())) if hasattr(rhs, "base") else ())
+    if DEBUG >= 6:
+      print("lhs metadata", getattr(lhs, "metadata", None))
+      print("rhs metadata", getattr(rhs, "metadata", None))
+      print("lhs parent shapes", [getattr(p, "shape", None) for p in lhs.src])
+      print("rhs parent shapes", [getattr(p, "shape", None) for p in rhs.src])
   if not any(name.startswith("conv") for name in meta_names):
     axes = tuple(red.arg[1]) if isinstance(red.arg, tuple) and len(red.arg) == 2 else tuple()
     if not axes or sorted(axes) != list(axes):
@@ -699,6 +704,9 @@ class RockchipProgram:
             )
     )
 
+    os.system("bash -c 'cd ~/npu/ops_reg/ && python dump.py 1' ")
+    os.system("bash -c 'cd ~/npu/ops_reg/ && python dump.py 2' ")
+    os.system("bash -c 'cd ~/npu/ops_reg/ && python dump.py 3' ")
     res = rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl,   
             __payload=submit_res
     )
