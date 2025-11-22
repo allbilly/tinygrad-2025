@@ -252,9 +252,6 @@ def _rockchip_conv_rewrite(red:UOp) -> UOp|None:
     if not axes or sorted(axes) != list(axes):
       if DEBUG >= 3: print("ROCKCHIP rewrite reject axes", axes)
       return None
-    if any(a < len(red.shape)-len(axes) for a in axes):
-      if DEBUG >= 3: print("ROCKCHIP rewrite reject axis position", axes, len(red.shape))
-      return None
     if lhs.shape != rhs.shape:
       if DEBUG >= 3: print("ROCKCHIP rewrite reject shape mismatch", lhs.shape, rhs.shape)
       return None
@@ -262,7 +259,7 @@ def _rockchip_conv_rewrite(red:UOp) -> UOp|None:
   ok, post_ops = _downstream_info(red)
   if not ok: return None
   info = _build_conv_info(meta_names, axes, lhs, rhs, red, post_ops)
-  if DEBUG >= 2:
+  if DEBUG >= 3:
     parent_ops = [p.op for p in red.parents]
     print("ROCKCHIP conv rewrite applied", info, "parents", parent_ops)
   return UOp(Ops.CUSTOM, red.dtype, src=mul.src, arg=info, metadata=red.metadata)
@@ -288,7 +285,7 @@ def _rockchip_conv_metadata_rewrite(node:UOp) -> UOp|None:
   info = _build_conv_info(meta_names, axes, lhs, rhs, node, post_ops, shape_overrides)
   if used_hint:
     _active_conv_metadata_used = True
-  if DEBUG >= 2:
+  if DEBUG >= 3:
     print("ROCKCHIP metadata rewrite applied", info)
   return UOp(Ops.CUSTOM, node.dtype, src=mul.src, arg=info, metadata=node.metadata)
 
@@ -417,7 +414,7 @@ class RockchipRenderer(Renderer):
           rhs_shape = data.get("rhs")
           out_shape = data.get("out")
           if not lhs_shape or not rhs_shape or not out_shape:
-            if DEBUG:
+            if DEBUG >= 3:
               print("RK_CONV render fallback: malformed metadata", meta.name)
             continue
           conv_info = RockchipConvInfo(
@@ -441,7 +438,7 @@ class RockchipRenderer(Renderer):
     if conv is not None:
       info_value = conv.arg if isinstance(conv.arg, RockchipConvInfo) else conv_info
       if info_value is None:
-        if DEBUG:
+        if DEBUG >= 3:
           print("RK_CONV render fallback: missing RockchipConvInfo", conv)
       else:
         def _find_global_id(node:UOp) -> int|None:
@@ -461,14 +458,14 @@ class RockchipRenderer(Renderer):
           return False
         store_uop = _find_store_for_conv(conv)
         if store_uop is None:
-          if DEBUG:
+          if DEBUG >= 3:
             print("RK_CONV render fallback: no direct STORE for conv output")
         else:
           out_gid = _find_global_id(store_uop.src[0])
           lhs_gid = _find_global_id(conv.src[0])
           rhs_gid = _find_global_id(conv.src[1])
           if None in (out_gid, lhs_gid, rhs_gid):
-            if DEBUG:
+            if DEBUG >= 3:
               print("RK_CONV render fallback: missing global ids", out_gid, lhs_gid, rhs_gid)
           else:
             globals_order = tuple(u.arg for u in uops if u.op is Ops.DEFINE_GLOBAL)
@@ -498,12 +495,12 @@ class RockchipDevice(Compiled):
     
     try:
       result = rk.DRM_IOCTL_GEM_FLINK(self.fd_ctl, __payload=flink_req)
-      
-      addr_info_parts = []
-      if virt_address is not None: addr_info_parts.append(f"va {hex(virt_address)}")
-      if dma_address is not None: addr_info_parts.append(f"dma {hex(dma_address)}")
-      addr_info = f" {' '.join(addr_info_parts)}" if addr_info_parts else ""
-      print(f"SUCCESS: Created flink name {flink_req.name} for handle {handle} {name}{addr_info}")
+      if DEBUG >= 3:
+        addr_info_parts = []
+        if virt_address is not None: addr_info_parts.append(f"va {hex(virt_address)}")
+        if dma_address is not None: addr_info_parts.append(f"dma {hex(dma_address)}")
+        addr_info = f" {' '.join(addr_info_parts)}" if addr_info_parts else ""
+        print(f"SUCCESS: Created flink name {flink_req.name} for handle {handle} {name}{addr_info}")
       return flink_req.name
     except Exception as e:
       print(f"ERROR: DRM_IOCTL_GEM_FLINK failed: {e}")
@@ -1107,7 +1104,7 @@ class RockchipProgram:
     self._submit_count = getattr(self, "_submit_count", 0) + 1
     if hasattr(self.device, "_submission_total"):
       self.device._submission_total += 1
-    if DEBUG >= 2:
+    if DEBUG >= 3:
       print(f"RK_CONV submit count {self._submit_count}")
       conv_debug = getattr(self, "_rk_conv_debug", None)
       if conv_debug is not None:
@@ -1175,11 +1172,9 @@ class RockchipProgram:
         rk.struct_rknpu_subcore_task(task_start=2, task_number=0),
       ),
     )
-    print("DRM_IOCTL_RKNPU_SUBMIT conv")
-    # os.system("bash -c 'cd ~/npu/ops_reg/ && python dump.py 1' ")
-    os.system("bash -c \"cd ~/npu/ops_reg/ && python dump.py 2 | grep EMIT | sed 's/\\x1B\\[[0-9;]*[a-zA-Z]//g' | sed 's/^.*EMIT(/EMIT(/' | tee /tmp/tinygrad_gem2\"")
-    # os.system("bash -c 'cd ~/npu/ops_reg/ && python dump.py 3' ")
-    # os.system("bash -c 'cd ~/npu/ops_reg/ && python dump.py 4' ")
+    if DEBUG >= 3:
+      print("DRM_IOCTL_RKNPU_SUBMIT conv")
+      os.system("bash -c \"cd ~/npu/ops_reg/ && python dump.py 2 | grep EMIT | sed 's/\\x1B\\[[0-9;]*[a-zA-Z]//g' | sed 's/^.*EMIT(/EMIT(/' | tee /tmp/tinygrad_gem2\"")
 
     rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl, __payload=submit_res)
     # os.system("bash -c 'cd ~/npu/ops_reg/ && python dump.py 5' ")
@@ -1204,20 +1199,81 @@ class RockchipProgram:
     except Exception:
       return None
 
-    def _infer_from_lengths(lhs_total:int, rhs_total:int, out_shape_val:tuple[int, ...]) -> tuple[int, int, int, int, int, int, int, int]|None:
+    def _infer_from_out_shape(lhs_total:int, rhs_total:int, out_shape_val:tuple[int, ...]) -> tuple[int, int, int, int, int, int, int, int]|None:
+      dims = [int(x) for x in out_shape_val if int(x) > 1] if out_shape_val else []
+      if len(dims) < 2:
+        return None
+      if len(dims) >= 4:
+        batch_guess = dims[0]
+        groups_guess = dims[-3]
+        out_per_group = dims[-2]
+        output_width_guess = dims[-1]
+        out_channels_guess = groups_guess * out_per_group
+      else:
+        batch_guess = dims[0] if len(dims) >= 3 else 1
+        out_channels_guess = dims[-2]
+        output_width_guess = dims[-1]
+        groups_guess = 1
+      if batch_guess <= 0 or out_channels_guess <= 0 or output_width_guess <= 0:
+        return None
+      for kw in range(1, min(output_width_guess + 1, rhs_total + 1)):
+        div = out_channels_guess * kw
+        if div == 0 or rhs_total % div:
+          continue
+        weight_in_channels = rhs_total // div
+        if weight_in_channels <= 0:
+          continue
+        in_channels_guess = weight_in_channels * max(groups_guess, 1)
+        if in_channels_guess <= 0:
+          continue
+        sample = in_channels_guess * (output_width_guess + kw - 1)
+        if sample <= 0 or lhs_total % sample:
+          continue
+        batches = lhs_total // sample
+        if batches != batch_guess:
+          continue
+        return (output_width_guess + kw - 1, kw, output_width_guess, in_channels_guess, out_channels_guess, max(groups_guess, 1), 1, 1)
+      return None
+
+    def _infer_from_lengths(lhs_total:int, rhs_total:int, out_shape_val:tuple[int, ...],
+                            input_w_hint:int|None=None, kw_hint:int|None=None,
+                            in_ch_hint:int|None=None, groups_hint:int|None=None,
+                            stride_hint:int|None=None, dilation_hint:int|None=None) -> tuple[int, int, int, int, int, int, int, int]|None:
       out_total = int(np.prod(out_shape_val)) if out_shape_val else 0
-      for in_ch in range(1, lhs_total + 1):
-        if lhs_total % in_ch: continue
+      if DEBUG >= 4:
+        print("RK_CONV length infer start", lhs_total, rhs_total, out_total,
+              "hints", input_w_hint, kw_hint, in_ch_hint, groups_hint, stride_hint, dilation_hint)
+      stride_candidates = [stride_hint] if stride_hint else [1]
+      dilation_candidates = [dilation_hint] if dilation_hint else [1]
+      in_ch_candidates = [in_ch_hint] if in_ch_hint else range(1, min(lhs_total, 128) + 1)
+      for in_ch in in_ch_candidates:
+        if in_ch <= 0 or lhs_total % in_ch: continue
         input_w = lhs_total // in_ch
-        for kw in range(1, min(input_w, rhs_total) + 1):
-          div = in_ch * kw
-          if rhs_total % div: continue
-          out_ch = rhs_total // div
-          output_w = input_w - kw + 1
-          if output_w <= 0: continue
-          if out_total and out_total != out_ch * output_w:
-            continue
-          return (input_w, kw, output_w, in_ch, out_ch, 1, 1, 1)
+        if input_w_hint and input_w_hint != input_w: continue
+        groups_candidates = [groups_hint] if groups_hint else [g for g in range(1, in_ch + 1) if in_ch % g == 0]
+        for groups in groups_candidates:
+          if groups is None or groups <= 0 or in_ch % groups: continue
+          weight_in = in_ch // groups
+          kw_candidates = [kw_hint] if kw_hint else range(1, min(input_w, rhs_total) + 1)
+          for kw in kw_candidates:
+            if kw is None or kw <= 0: continue
+            div = weight_in * kw
+            if div == 0 or rhs_total % div: continue
+            out_ch = rhs_total // div
+            if out_ch <= 0 or out_ch % groups: continue
+            for stride in stride_candidates:
+              if stride is None or stride <= 0: continue
+              for dilation in dilation_candidates:
+                if dilation is None or dilation <= 0: continue
+                eff_kw = (kw - 1) * dilation + 1
+                output_w = (input_w - eff_kw) // stride + 1
+                if output_w <= 0: continue
+                expected = out_ch * output_w
+                if out_total and out_total != expected:
+                  continue
+                if DEBUG >= 4:
+                  print("RK_CONV length infer", input_w, kw, output_w, in_ch, out_ch, groups, stride, dilation)
+                return (input_w, kw, output_w, in_ch, out_ch, groups, stride, dilation)
       return None
 
     def _shape_or_fallback(meta_shape:tuple[int, ...]|None, *fallback:tuple[int, ...]) -> tuple[int, ...]:
@@ -1235,45 +1291,80 @@ class RockchipProgram:
     stride_shape = data.get("stride")
     dilation_shape = data.get("dilation")
     groups_shape = data.get("groups")
+    if (len(lhs_shape) <= 1 or len(rhs_shape) <= 1) and out_shape:
+      direct = _infer_from_out_shape(lhs_len_single, rhs_len_single, out_shape)
+      if direct is not None:
+        return direct
     if not lhs_shape or not rhs_shape:
-      return None
+      direct = _infer_from_out_shape(lhs_len_single, rhs_len_single, out_shape)
+      if direct is not None:
+        return direct
+      return _infer_from_lengths(lhs_len_single, rhs_len_single, out_shape)
 
-    input_width = int(lhs_shape[-1])
-    rhs_channels = int(rhs_shape[-2]) if len(rhs_shape) >= 2 else 1
-    in_channels = int(lhs_shape[-2]) if len(lhs_shape) >= 2 else rhs_channels
-    kernel_width = int(hw_shape[-1]) if hw_shape else (int(rhs_shape[-1]) if len(rhs_shape) >= 1 else max(1, input_width - 1))
-    out_channels = int(rhs_shape[0]) if len(rhs_shape) >= 1 else (int(out_shape[-2]) if len(out_shape) >= 2 else 1)
+    input_width = int(lhs_shape[-1]) if lhs_shape else 0
+    rhs_channels = int(rhs_shape[-2]) if len(rhs_shape) >= 2 else 0
+    in_channels = int(lhs_shape[-2]) if len(lhs_shape) >= 2 else (rhs_channels if rhs_channels else 0)
+    kernel_width = int(hw_shape[-1]) if hw_shape else (int(rhs_shape[-1]) if len(rhs_shape) >= 2 else 0)
+    out_channels = int(out_shape[-2]) if len(out_shape) >= 2 else (int(rhs_shape[0]) if len(rhs_shape) >= 1 and len(rhs_shape) > 1 else 0)
     stride = int(stride_shape[-1]) if stride_shape else 1
     dilation = int(dilation_shape[-1]) if dilation_shape else 1
     groups = int(groups_shape[0]) if groups_shape else (in_channels // rhs_channels if rhs_channels and in_channels % rhs_channels == 0 else 1)
     eff_kernel = (kernel_width - 1) * dilation + 1
-    if out_shape:
-      output_width = int(out_shape[-1])
-    else:
-      output_width = (input_width - eff_kernel) // stride + 1
-    expected_output = (input_width - eff_kernel) // stride + 1
-    if output_width != expected_output or output_width <= 0:
-      output_width = expected_output
+    output_width = (input_width - eff_kernel) // stride + 1 if input_width and eff_kernel else 0
+    out_known = int(np.prod(out_shape)) if out_shape else 0
 
-    if input_width <= 0 or output_width <= 0 or kernel_width <= 0:
-      return _infer_from_lengths(lhs_len_single, rhs_len_single, out_shape)
-    if stride <= 0 or dilation <= 0 or groups <= 0:
-      return _infer_from_lengths(lhs_len_single, rhs_len_single, out_shape)
-    return (input_width, kernel_width, output_width, in_channels, out_channels, groups, stride, dilation)
+    weight_in_channels = in_channels // groups if groups and in_channels % groups == 0 else None
+    sample_elems = input_width * in_channels if input_width and in_channels else 0
+    rhs_expected = out_channels * (weight_in_channels if weight_in_channels is not None else rhs_channels) * kernel_width if out_channels else 0
+    batch_guess = (lhs_len_single // sample_elems) if sample_elems > 0 else 0
+    out_expected = out_channels * output_width * (batch_guess if batch_guess > 0 else 1) if out_channels and output_width else 0
+    valid_dims = (
+      input_width > 0 and kernel_width > 0 and output_width > 0 and in_channels > 0 and out_channels > 0 and weight_in_channels is not None
+      and stride > 0 and dilation > 0 and groups > 0 and sample_elems > 0 and lhs_len_single % sample_elems == 0
+      and rhs_expected > 0 and rhs_len_single == rhs_expected
+      and (not out_known or out_known in (out_channels * output_width, out_expected))
+    )
+    if valid_dims:
+      return (input_width, kernel_width, output_width, in_channels, out_channels, groups, stride, dilation)
+
+    sample_ok = input_width > 0 and in_channels > 0 and lhs_len_single % (input_width * in_channels if input_width and in_channels else 1) == 0
+    kw_ok = kernel_width > 0 and rhs_len_single % kernel_width == 0
+    return _infer_from_lengths(lhs_len_single, rhs_len_single, out_shape,
+                               input_w_hint=input_width if sample_ok else None,
+                               kw_hint=kernel_width if kw_ok else None,
+                               in_ch_hint=in_channels if in_channels > 0 and lhs_len_single % in_channels == 0 else None,
+                               groups_hint=groups if groups > 0 and in_channels > 0 and in_channels % max(groups, 1) == 0 else None,
+                               stride_hint=stride if stride > 0 else None,
+                               dilation_hint=dilation if dilation > 0 else None)
 
   def _conv1d_hw_full(self, lhs_vec: np.ndarray, rhs_vec: np.ndarray, dtype: DType, np_dtype: np.dtype,
                       input_width:int, kernel_width:int, output_width:int,
                       in_channels:int, out_channels:int, groups:int, stride:int, dilation:int,
                       batch_count:int=1) -> np.ndarray|None:
-    if any(x != 1 for x in (groups, stride, dilation)): return None
-    if batch_count <= 0 or in_channels <= 0 or out_channels <= 0: return None
+    if any(x != 1 for x in (stride, dilation)): return None
+    if batch_count <= 0 or in_channels <= 0 or out_channels <= 0 or groups <= 0: return None
     if input_width < kernel_width: return None
+    if in_channels % groups != 0: return None
+    weight_in_channels = in_channels // groups
     sample_elems = input_width * in_channels
     if lhs_vec.size != sample_elems * batch_count: return None
-    if rhs_vec.size != out_channels * in_channels * kernel_width: return None
+    if rhs_vec.size != out_channels * weight_in_channels * kernel_width: return None
 
     lhs_fp16 = np.ascontiguousarray(lhs_vec.astype(np.float16, copy=False))
-    rhs_fp16 = np.ascontiguousarray(rhs_vec.astype(np.float16, copy=False))
+    rhs_view = np.ascontiguousarray(rhs_vec.astype(np.float16, copy=False))
+    if groups == 1:
+      rhs_fp16 = rhs_view
+    else:
+      if out_channels % groups != 0: return None
+      out_per_group = out_channels // groups
+      expanded = np.zeros((out_channels, in_channels, kernel_width), dtype=np.float16)
+      rhs_reshaped = rhs_view.reshape(out_channels, weight_in_channels, kernel_width)
+      for g in range(groups):
+        for ocg in range(out_per_group):
+          oc = g * out_per_group + ocg
+          start = g * weight_in_channels
+          expanded[oc, start:start + weight_in_channels, :] = rhs_reshaped[oc]
+      rhs_fp16 = expanded.reshape(-1)
 
     channel_align = max(8, ((in_channels + 7) // 8) * 8)
     out_channel_align = max(16, ((out_channels + 15) // 16) * 16)
@@ -1283,7 +1374,7 @@ class RockchipProgram:
     element_size = np.dtype(np.float16).itemsize
     row_bytes = dst_stride * out_channel_align * element_size
     surface_add = dst_stride * 2
-    if DEBUG >= 2:
+    if DEBUG >= 3:
       print("RK_CONV layout dst_stride", dst_stride, "out_channel_align", out_channel_align,
             "row_bytes", row_bytes, "surface_add", surface_add, "batch", batch_count)
 
@@ -1312,7 +1403,7 @@ class RockchipProgram:
     packed_output_elems_per_sample = output_c1 * dst_stride * out_channel_align
     weight_bytes = weights_packed.nbytes
     output_bytes = packed_output_elems_per_sample * element_size
-    if DEBUG >= 2:
+    if DEBUG >= 3:
       print("RK_CONV packed_input elems", first_packed.size, "bytes", input_bytes,
             "width_stride", input_width_aligned, "channel_align", channel_align)
       print("RK_CONV packed_output elems", packed_output_elems_per_sample, "bytes", output_bytes,
@@ -1355,11 +1446,12 @@ class RockchipProgram:
 
         packed_output = np.frombuffer(ctypes.string_at(output_hw.va_addr, output_bytes),
                                       dtype=np.float16, count=packed_output_elems_per_sample)
+        unpack_c2 = max(8, ((out_channels + 7) // 8) * 8)
         unpacked = self._unpack_nc1hwc2_fp16(packed_output, 1, out_channels, 1, output_width,
-                                             channel_align, dst_stride)
+                                             unpack_c2, dst_stride)
         results[batch_idx] = unpacked[0, :, 0, :]
 
-      if DEBUG >= 2:
+      if DEBUG >= 3:
         print("RK_CONV unpacked sample", results[0])
         input_batch = lhs_view[0, :, 0, :].astype(np.float32)
         kernel_ref = rhs_fp16.reshape(out_channels, in_channels, kernel_width).astype(np.float32)
@@ -1397,6 +1489,26 @@ class RockchipProgram:
     if batch <= 0 or channels <= 0 or height <= 0 or width <= 0 or width_stride <= 0 or c2 <= 0:
       return np.zeros((max(batch, 0), max(channels, 0), max(height, 0), max(width, 0)), dtype=np.float32)
 
+    c_ratio = c2 // channels if channels > 0 else 0
+    use_nhwc_pack = (c_ratio == 2) and (width_stride >= width)
+    if use_nhwc_pack:
+      row_stride = width_stride * channels
+      plane_stride = height * row_stride
+      total = batch * plane_stride
+      dst = np.zeros((batch, channels, height, width), dtype=np.float32)
+      src_view = np.ascontiguousarray(src.astype(np.float16, copy=False)).reshape(-1)
+      if src_view.size < total:
+        src_view = np.pad(src_view, (0, total - src_view.size))
+      for n in range(batch):
+        n_base = n * plane_stride
+        for h in range(height):
+          h_base = n_base + h * row_stride
+          for w in range(width):
+            w_base = h_base + w * channels
+            for c in range(channels):
+              dst[n, c, h, w] = float(src_view[w_base + c])
+      return dst
+
     c1 = max(1, (channels + c2 - 1) // c2)
     plane_stride = height * width_stride * c2
     dst = np.zeros((batch, channels, height, width), dtype=np.float32)
@@ -1426,6 +1538,22 @@ class RockchipProgram:
     """
     if batch <= 0 or channels <= 0 or height <= 0 or width <= 0 or width_stride <= 0 or c2 <= 0:
       return np.zeros(0, dtype=np.float16)
+    c_ratio = c2 // channels if channels > 0 else 0
+    use_nhwc_pack = (c_ratio == 2) and (width_stride >= width)
+    if use_nhwc_pack:
+      row_stride = width_stride * channels
+      plane_stride = height * row_stride
+      dst = np.zeros(batch * plane_stride, dtype=np.float16)
+      src_view = np.ascontiguousarray(src.astype(np.float16, copy=False)).reshape(batch, channels, height, width)
+      idx = 0
+      for n in range(batch):
+        for h in range(height):
+          for w in range(width_stride):
+            for c in range(channels):
+              if w < width:
+                dst[idx] = src_view[n, c, h, w]
+              idx += 1
+      return dst
     c1 = max(1, math.ceil(channels / c2))
     plane_stride = height * width_stride * c2
     dst = np.zeros(batch * c1 * plane_stride, dtype=np.float16)
@@ -1509,20 +1637,17 @@ class RockchipProgram:
                                 batch_count=1)
       if regs_snapshot is None:
         regs_snapshot = list(self.q)
-        if DEBUG:
+        if DEBUG >= 3:
           print("RK_CONV DMA", hex(input_hw.meta.dma_addr), hex(weight_hw.meta.dma_addr), hex(output_hw.meta.dma_addr))
       self._submit_conv()
 
       raw_output = ctypes.string_at(output_hw.va_addr, output_hw_bytes)
-      if DEBUG and idx == 0:
+      if DEBUG >= 3 and idx == 0:
         hex_len = 64 if DEBUG >= 3 else 32
         print("RK_CONV raw", raw_output[:hex_len].hex())
         print("RK_CONV regs len", len(regs_snapshot) if regs_snapshot else 0)
         if regs_snapshot:
-          if DEBUG >= 3:
-            print("RK_CONV regs full", [hex(v) for v in regs_snapshot])
-          else:
-            print("RK_CONV regs", [hex(v) for v in regs_snapshot[:10]])
+          print("RK_CONV regs full", [hex(v) for v in regs_snapshot])
 
       if output_hw_bytes >= 4:
         word = np.frombuffer(raw_output, dtype=np.uint32, count=1)[0]
@@ -1650,7 +1775,7 @@ class RockchipProgram:
       reg(input_width_aligned, rk.CNA_DATA_SIZE0_DATAIN_WIDTH__SHIFT, rk.CNA_DATA_SIZE0_DATAIN_WIDTH__MASK) |
       reg(data_in_height, rk.CNA_DATA_SIZE0_DATAIN_HEIGHT__SHIFT, rk.CNA_DATA_SIZE0_DATAIN_HEIGHT__MASK))
     emit(rk.CNA, rk.REG_CNA_DATA_SIZE0, data_size0_val)
-    if DEBUG >= 2:
+    if DEBUG >= 3:
       print("RK_CONV reg CNA_DATA_SIZE0 width", input_width_aligned,
             "height", data_in_height, "word", hex(data_size0_val))
     if use_packed_channels:
@@ -1664,7 +1789,7 @@ class RockchipProgram:
       reg(output_width, rk.CNA_DATA_SIZE2_DATAOUT_WIDTH__SHIFT, rk.CNA_DATA_SIZE2_DATAOUT_WIDTH__MASK))
     data_size3_val = reg(dataout_atomics, rk.CNA_DATA_SIZE3_DATAOUT_ATOMICS__SHIFT, rk.CNA_DATA_SIZE3_DATAOUT_ATOMICS__MASK)
     emit(rk.CNA, rk.REG_CNA_DATA_SIZE3, data_size3_val)
-    if DEBUG >= 2:
+    if DEBUG >= 3:
       print("RK_CONV reg CNA_DATA_SIZE3 atomics", dataout_atomics, "word", hex(data_size3_val))
     emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE0, weight_bytes_total)
     emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE1,
@@ -1721,12 +1846,12 @@ class RockchipProgram:
       reg(output_height_minus1, rk.CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT__SHIFT, rk.CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT__MASK) |
       reg(data_cube_width, rk.CORE_DATAOUT_SIZE_0_DATAOUT_WIDTH__SHIFT, rk.CORE_DATAOUT_SIZE_0_DATAOUT_WIDTH__MASK))
     emit(rk.CORE, rk.REG_CORE_DATAOUT_SIZE_0, core_dataout_size_0_val)
-    if DEBUG >= 2:
+    if DEBUG >= 3:
       print("RK_CONV reg CORE_DATAOUT_SIZE_0 height", output_height_minus1,
             "width", data_cube_width, "word", hex(core_dataout_size_0_val))
     core_dataout_size_1_val = reg(out_channel_field, rk.CORE_DATAOUT_SIZE_1_DATAOUT_CHANNEL__SHIFT, rk.CORE_DATAOUT_SIZE_1_DATAOUT_CHANNEL__MASK)
     emit(rk.CORE, rk.REG_CORE_DATAOUT_SIZE_1, core_dataout_size_1_val)
-    if DEBUG >= 2:
+    if DEBUG >= 3:
       print("RK_CONV reg CORE_DATAOUT_SIZE_1 channels", out_channel_field, "word", hex(core_dataout_size_1_val))
     emit(rk.CORE, rk.REG_CORE_CLIP_TRUNCATE, 0)
     self.emit_raw(rk.CORE, 0x3030, 0)
@@ -1742,13 +1867,13 @@ class RockchipProgram:
       reg(output_dma, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
     dpu_dst_surf_stride_val = reg(dst_stride, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__SHIFT, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__MASK)
     emit(rk.DPU, rk.REG_DPU_DST_SURF_STRIDE, dpu_dst_surf_stride_val)
-    if DEBUG >= 2:
+    if DEBUG >= 3:
       print("RK_CONV reg DPU_DST_SURF_STRIDE dst_stride", dst_stride, "word", hex(dpu_dst_surf_stride_val))
     emit(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH,
       reg(data_cube_width, rk.DPU_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_DATA_CUBE_WIDTH_WIDTH__MASK))
     dpu_data_cube_height_val = reg(output_height_minus1, rk.DPU_DATA_CUBE_HEIGHT_HEIGHT__SHIFT, rk.DPU_DATA_CUBE_HEIGHT_HEIGHT__MASK)
     emit(rk.DPU, rk.REG_DPU_DATA_CUBE_HEIGHT, dpu_data_cube_height_val)
-    if DEBUG >= 2:
+    if DEBUG >= 3:
       print("RK_CONV reg DPU_DATA_CUBE_HEIGHT height_minus1", output_height_minus1, "word", hex(dpu_data_cube_height_val))
     emit(rk.DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0)
     emit(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL,
@@ -1770,13 +1895,13 @@ class RockchipProgram:
     emit(rk.DPU, rk.REG_DPU_BS_OW_OP, 0)
     dpu_wdma_size_0_val = reg(out_channel_field, rk.DPU_WDMA_SIZE_0_CHANNEL_WDMA__SHIFT, rk.DPU_WDMA_SIZE_0_CHANNEL_WDMA__MASK)
     emit(rk.DPU, rk.REG_DPU_WDMA_SIZE_0, dpu_wdma_size_0_val)
-    if DEBUG >= 2:
+    if DEBUG >= 3:
       print("RK_CONV reg DPU_WDMA_SIZE_0 channel_field", out_channel_field, "word", hex(dpu_wdma_size_0_val))
     dpu_wdma_size_1_val = (
       reg(output_height_minus1, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__MASK) |
       reg(data_cube_width, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__MASK))
     emit(rk.DPU, rk.REG_DPU_WDMA_SIZE_1, dpu_wdma_size_1_val)
-    if DEBUG >= 2:
+    if DEBUG >= 3:
       print("RK_CONV reg DPU_WDMA_SIZE_1 height", output_height_minus1,
             "width", data_cube_width, "word", hex(dpu_wdma_size_1_val))
     emit(rk.DPU, rk.REG_DPU_BN_CFG,
@@ -1812,7 +1937,7 @@ class RockchipProgram:
     emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_7, 0)
     dpu_surface_add_val = reg(surface_add, rk.DPU_SURFACE_ADD_SURF_ADD__SHIFT, rk.DPU_SURFACE_ADD_SURF_ADD__MASK)
     emit(rk.DPU, rk.REG_DPU_SURFACE_ADD, dpu_surface_add_val)
-    if DEBUG >= 2:
+    if DEBUG >= 3:
       print("RK_CONV reg DPU_SURFACE_ADD surface_add", surface_add,
             "row_bytes", row_bytes, "word", hex(dpu_surface_add_val))
     emit(rk.DPU, rk.REG_DPU_LUT_ACCESS_CFG, 0)
@@ -1848,8 +1973,8 @@ class RockchipProgram:
         "output_height_minus1": output_height_minus1,
         "dataout_atomics": dataout_atomics,
       }
-      if DEBUG >= 2:
-        print("RK_CONV register words", len(self.q))
+    if DEBUG >= 3:
+      print("RK_CONV register words", len(self.q))
 
   def _execute_rk_conv(self, bufs: tuple[Any, ...], wait: bool=False):
     assert self._rk_conv_payload is not None
@@ -1876,7 +2001,7 @@ class RockchipProgram:
         dtypes.int32: np.int32,
       }
       return mapping.get(dt, np.float32)
-    if DEBUG:
+    if DEBUG >= 3:
       print("RK_CONV payload", info, metadata)
       print("lhs shape", lhs_shape_flat, "rhs shape", rhs_shape_flat, "out shape", out_shape_write, "dtype", dtype)
     np_dtype = _np_dtype(dtype)
@@ -1896,7 +2021,7 @@ class RockchipProgram:
     # If graph dtype is wider than the buffer, fall back to fp16 (observed when DEFAULT_FLOAT=HALF inserts casts).
     if item_size and (len(lhs_bytes) % item_size != 0 or len(rhs_bytes) % item_size != 0):
       if len(lhs_bytes) % np.dtype(np.float16).itemsize == 0 and len(rhs_bytes) % np.dtype(np.float16).itemsize == 0:
-        if DEBUG:
+        if DEBUG >= 3:
           print("RK_CONV dtype fallback to fp16 due to buffer size mismatch")
         np_dtype = np.float16
         dtype_read = np.dtype(np_dtype)
@@ -1908,6 +2033,32 @@ class RockchipProgram:
     rhs_elems = _shape_prod(rhs_shape_flat)
     out_elems = _shape_prod(out_shape_write)
     axes = info.axes or tuple()
+
+    if item_size and (
+      (lhs_elems and lhs_elems * item_size != len(lhs_bytes)) or
+      (rhs_elems and rhs_elems * item_size != len(rhs_bytes))
+    ):
+      if len(lhs_bytes) % np.dtype(np.float16).itemsize == 0 and len(rhs_bytes) % np.dtype(np.float16).itemsize == 0:
+        if DEBUG >= 3:
+          print("RK_CONV dtype fallback to fp16 due to element-size mismatch")
+        np_dtype = np.float16
+        dtype_read = np.dtype(np_dtype)
+        item_size = dtype_read.itemsize
+      else:
+        raise ValueError("RK_CONV element-size mismatch for buffers")
+
+    lhs_len_single = int(lhs_elems)
+    rhs_len_single = int(rhs_elems)
+
+    conv1d_dims = None
+    try:
+      conv1d_dims = self._conv1d_shape_info(info, lhs_len_single, rhs_len_single)
+      if DEBUG >= 3:
+        print("RK_CONV 1d dims (precheck)", conv1d_dims)
+    except Exception as exc:
+      if DEBUG >= 3:
+        print("RK_CONV 1d dims inference failed", exc)
+      conv1d_dims = None
 
     conv2d_dims: tuple[int, int, int, int, int, int, int, int, int]|None = None
     if (lhs_shape_flat and rhs_shape_flat and out_shape_write and len(lhs_shape_flat) == 1
@@ -1935,7 +2086,7 @@ class RockchipProgram:
       try:
         hw_arr = self._conv2d_hw(lhs_arr, rhs_arr, dtype, np_dtype)
       except Exception as exc:
-        if DEBUG:
+        if DEBUG >= 3:
           import traceback
           print("RK_CONV conv2d_hw failed", exc)
           traceback.print_exc()
@@ -1950,74 +2101,46 @@ class RockchipProgram:
       self._write_bytes(out_buf, out_view.tobytes())
       return 0.0
 
-    if DEBUG >= 2:
+    if conv1d_dims is not None:
+      if DEBUG >= 3:
+        print("RK_CONV 1d path", conv1d_dims)
+      input_width, kernel_width, output_width, in_channels, out_channels, groups, stride, dilation = conv1d_dims
+      lhs_vec = np.frombuffer(lhs_bytes, dtype=dtype_read)
+      rhs_vec = np.frombuffer(rhs_bytes, dtype=dtype_read)
+      per_sample_elems = input_width * in_channels
+      if per_sample_elems <= 0 or lhs_len_single < per_sample_elems:
+        raise RuntimeError("invalid 1D convolution buffer size for dims %s" % (conv1d_dims,))
+      if lhs_len_single % per_sample_elems != 0:
+        raise RuntimeError("RK_CONV 1d buffer length not divisible by sample size %s" % (conv1d_dims,))
+      batch_count = lhs_len_single // per_sample_elems
+      if DEBUG >= 3 and batch_count > 1:
+        print("RK_CONV 1d batches", batch_count)
+      output_elems_per_sample = out_channels * output_width
+      total_output_elements = batch_count * output_elems_per_sample
+      result_arr = self._conv1d_hw_full(lhs_vec, rhs_vec, dtype, np_dtype, *conv1d_dims, batch_count=batch_count)
+      if result_arr is None:
+        raise RuntimeError("RK_CONV hardware path returned no data for dims %s" % (conv1d_dims,))
+      if result_arr.size != total_output_elements:
+        raise RuntimeError("RK_CONV output size mismatch for dims %s" % (conv1d_dims,))
+      if post_ops:
+        result_arr = self._apply_post_ops_array(result_arr, post_ops)
+      target_shape = tuple(int(x) for x in out_shape_write)
+      if target_shape and int(np.prod(target_shape)) == result_arr.size:
+        reshaped = result_arr.reshape(target_shape)
+      else:
+        reshaped = result_arr.reshape((batch_count, out_channels, output_width))
+      self._write_bytes(out_buf, reshaped.tobytes())
+      return 0.0
+
+    if DEBUG >= 3:
       print("RK_CONV shapes", lhs_shape_flat, rhs_shape_flat)
     if (lhs_shape_flat and rhs_shape_flat and len(lhs_shape_flat) <= 3
         and len(rhs_shape_flat) <= 3):
-      if DEBUG >= 2:
-        print("RK_CONV 1d candidate", lhs_shape_flat, rhs_shape_flat)
-      lhs_len_single = int(lhs_elems)
-      rhs_len_single = int(rhs_elems)
+      if DEBUG >= 3:
+        print("RK_CONV 1d candidate (fallback)", lhs_shape_flat, rhs_shape_flat)
       lhs_vec = np.frombuffer(lhs_bytes, dtype=dtype_read)
       rhs_vec = np.frombuffer(rhs_bytes, dtype=dtype_read)
-
-      dims = None
-      per_sample_elems = batch_count = output_elems_per_sample = total_output_elements = 0
-      error: Exception|None = None
-      result_arr: np.ndarray|None = None
-      try:
-        dims = self._conv1d_shape_info(info, lhs_len_single, rhs_len_single)
-        if DEBUG >= 2:
-          print("RK_CONV 1d dims", dims)
-        if dims is None:
-          raise RuntimeError("RK_CONV metadata does not describe a valid RKNC1d")
-        input_width, kernel_width, output_width, in_channels, out_channels, groups, stride, dilation = dims
-        per_sample_elems = input_width * in_channels
-        if per_sample_elems <= 0 or lhs_len_single < per_sample_elems:
-          raise RuntimeError("invalid 1D convolution buffer size for dims %s" % (dims,))
-        if lhs_len_single % per_sample_elems != 0:
-          raise RuntimeError("RK_CONV 1d buffer length not divisible by sample size %s" % (dims,))
-        batch_count = lhs_len_single // per_sample_elems
-        if DEBUG >= 2 and batch_count > 1:
-          print("RK_CONV 1d batches", batch_count)
-        output_elems_per_sample = out_channels * output_width
-        total_output_elements = batch_count * output_elems_per_sample
-        result_arr = self._conv1d_hw_full(lhs_vec, rhs_vec, dtype, np_dtype, *dims, batch_count=batch_count)
-        if result_arr is None:
-          raise RuntimeError("RK_CONV hardware path returned no data for dims %s" % (dims,))
-        if result_arr.size != total_output_elements:
-          raise RuntimeError("RK_CONV output size mismatch for dims %s" % (dims,))
-      except Exception as exc:
-        error = exc
-        if DEBUG:
-          print("RK_CONV multi-batch path failed, falling back:", exc)
-          import traceback
-          traceback.print_exc()
-        result_arr = None
-      if result_arr is None:
-        if dims is None:
-          raise RuntimeError("RK_CONV metadata does not describe a valid RKNC1d") from (error or None)
-        if DEBUG >= 2:
-          print("RK_CONV fallback splits", batch_count, "batches")
-        batch_results = np.empty((batch_count, output_elems_per_sample), dtype=np_dtype)
-        for batch_idx in range(batch_count):
-          offset = batch_idx * per_sample_elems
-          sample = lhs_vec[offset:offset + per_sample_elems]
-          if sample.size != per_sample_elems:
-            raise RuntimeError("RK_CONV sample size mismatch for dims %s" % (dims,))
-          batch_arr = self._conv1d_hw_full(sample, rhs_vec, dtype, np_dtype, *dims, batch_count=1)
-          if batch_arr is None:
-            raise RuntimeError("RK_CONV hardware fallback failed for dims %s on batch %d" % (dims, batch_idx))
-          if batch_arr.size != output_elems_per_sample:
-            raise RuntimeError("RK_CONV output size mismatch for dims %s" % (dims,))
-          batch_results[batch_idx] = batch_arr
-        result_arr = batch_results.reshape(total_output_elements)
-
-      if post_ops:
-        result_arr = self._apply_post_ops_array(result_arr, post_ops)
-      reshaped = result_arr.reshape(tuple(int(x) for x in out_shape_write))
-      self._write_bytes(out_buf, reshaped.tobytes())
-      return 0.0
+      dims = self._conv1d_shape_info(info, int(lhs_elems), int(rhs_elems))
 
     lhs_shape = lhs_shape_flat
     rhs_shape = rhs_shape_flat
@@ -2040,7 +2163,7 @@ class RockchipProgram:
     try:
       hw_arr = self._conv2d_hw(lhs_arr, rhs_arr, dtype, np_dtype)
     except Exception as exc:
-      if DEBUG:
+      if DEBUG >= 3:
         import traceback
         print("RK_CONV conv2d_hw failed", exc)
         traceback.print_exc()
