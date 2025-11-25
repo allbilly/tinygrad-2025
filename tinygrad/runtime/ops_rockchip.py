@@ -479,7 +479,7 @@ class RockchipRenderer(Renderer):
 
 
 class RockchipDevice(Compiled):
-  def create_flink_name(self, handle: int, name:str, virt_address:int|None=None, dma_address:int|None=None) -> int:
+  def create_flink_name(self, handle: int, name:str, virt_address:int|None=None, obj_addr:int|None=None, dma_address:int|None=None) -> int:
     """
     Create a flink name for a GEM handle using DRM_IOCTL_GEM_FLINK.
     Args:
@@ -498,9 +498,10 @@ class RockchipDevice(Compiled):
       if DEBUG >= 3:
         addr_info_parts = []
         if virt_address is not None: addr_info_parts.append(f"va {hex(virt_address)}")
+        if obj_addr is not None: addr_info_parts.append(f"obj {hex(obj_addr)}")
         if dma_address is not None: addr_info_parts.append(f"dma {hex(dma_address)}")
         addr_info = f" {' '.join(addr_info_parts)}" if addr_info_parts else ""
-        print(f"SUCCESS: Created flink name {flink_req.name} for handle {handle} {name}{addr_info}")
+        print(f"SUCCESS: Created flink name {flink_req.name} for handle {handle} {name} {addr_info}")
       return flink_req.name
     except Exception as e:
       print(f"ERROR: DRM_IOCTL_GEM_FLINK failed: {e}")
@@ -511,7 +512,7 @@ class RockchipDevice(Compiled):
     mem_map = rk.DRM_IOCTL_RKNPU_MEM_MAP(self.fd_ctl, handle=mem_create.handle, offset=0)
     va_addr = self.fd_ctl.mmap(0, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, mem_map.offset)
 
-    flink_name = self.create_flink_name(mem_create.handle, name, virt_address=va_addr, dma_address=mem_create.dma_addr)
+    flink_name = self.create_flink_name(mem_create.handle, name, virt_address=va_addr, obj_addr=mem_create.obj_addr, dma_address=mem_create.dma_addr)
     mem_create.flink_name = flink_name
 
     return HCQBuffer(va_addr=va_addr, size=size, meta=mem_create)
@@ -1101,6 +1102,11 @@ class RockchipProgram:
     sequences = cmd_sequences if cmd_sequences is not None else [list(self.q)]
     if not sequences:
       return
+    try:
+      rk.DRM_IOCTL_RKNPU_ACTION(self.device.fd_ctl, flags=rk.RKNPU_ACT_RESET)
+    except Exception as exc:
+      if DEBUG:
+        print("RK_CONV reset failed", exc)
     self._submit_count = getattr(self, "_submit_count", 0) + 1
     if hasattr(self.device, "_submission_total"):
       self.device._submission_total += 1
@@ -1134,11 +1140,11 @@ class RockchipProgram:
       raise RuntimeError("RK_CONV task buffer overflow")
     for task_idx, (seq, offset) in enumerate(zip(sequences, offsets)):
       tasks[task_idx].flags = 0
-      tasks[task_idx].op_idx = 0
+      tasks[task_idx].op_idx = 1
       tasks[task_idx].enable_mask = 0xd
       tasks[task_idx].int_mask = 0x300
       tasks[task_idx].int_clear = 0x1ffff
-      tasks[task_idx].int_status = 0x100
+      tasks[task_idx].int_status = 0
       tasks[task_idx].regcfg_amount = len(seq)
       tasks[task_idx].regcfg_offset = 0
       tasks[task_idx].regcmd_addr = self.device.cmd_buf.meta.dma_addr + offset * ctypes.sizeof(ctypes.c_uint64)
@@ -1157,28 +1163,36 @@ class RockchipProgram:
       flags=rk.RKNPU_JOB_PC | rk.RKNPU_JOB_BLOCK | rk.RKNPU_JOB_PINGPONG,
       timeout=6000,
       task_start=0,
-      task_number=len(sequences),
+      # task_number=len(sequences),
+      task_number=1,
       task_counter=0,
       priority=0,
       task_obj_addr=self.device.task_buf.meta.obj_addr,
       regcfg_obj_addr=0,
       task_base_addr=0,
       user_data=0,
-      core_mask=1,
+      core_mask=0,
       fence_fd=-1,
       subcore_task=(rk.struct_rknpu_subcore_task * 5)(
-        rk.struct_rknpu_subcore_task(task_start=0, task_number=len(sequences)),
-        rk.struct_rknpu_subcore_task(task_start=1, task_number=0),
-        rk.struct_rknpu_subcore_task(task_start=2, task_number=0),
+        rk.struct_rknpu_subcore_task(task_start=0, task_number=1),
+        rk.struct_rknpu_subcore_task(task_start=0, task_number=1),
+        rk.struct_rknpu_subcore_task(task_start=0, task_number=1),
       ),
     )
+    print("self.device.task_buf.meta.obj_addr", hex(self.device.task_buf.meta.obj_addr))
     if DEBUG >= 3:
-      print("DRM_IOCTL_RKNPU_SUBMIT conv")
-      os.system("bash -c \"cd ~/npu/ops_reg/ && python dump.py 2 | grep EMIT | sed 's/\\x1B\\[[0-9;]*[a-zA-Z]//g' | sed 's/^.*EMIT(/EMIT(/' | tee /tmp/tinygrad_gem2\"")
+      os.system("bash -c 'cd ~/npu/ops_rknn/ && python dump.py 1' ")
+      os.system("bash -c 'cd ~/npu/ops_rknn/ && python dump.py 2' ")
+      os.system("bash -c \"cd ~/npu/ops_rknn/ && python dump.py 2 | grep EMIT | sed 's/\\x1B\\[[0-9;]*[a-zA-Z]//g' | sed 's/^.*EMIT(/EMIT(/' > /tmp/tinygrad_gem2\"")
+      os.system("bash -c 'cd ~/npu/ops_rknn/ && python dump.py 3' ")
+      os.system("bash -c 'cd ~/npu/ops_rknn/ && python dump.py 4' ")
+      os.system("bash -c 'cd ~/npu/ops_rknn/ && python dump.py 5' ")
 
+
+    print("DRM_IOCTL_RKNPU_SUBMIT_CONV")
     rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl, __payload=submit_res)
-    # os.system("bash -c 'cd ~/npu/ops_reg/ && python dump.py 5' ")
-    # os.system("bash -c 'cd ~/npu/ops_reg/ && python dump.py 6' ")
+    if DEBUG >= 3:
+      os.system("bash -c 'cd ~/npu/ops_rknn/ && python dump.py 5' ")
 
     self.q = []
 
@@ -1573,7 +1587,7 @@ class RockchipProgram:
     return dst
 
   def _pack_conv_weights_fp16(self, src: np.ndarray, out_channels:int, in_channels:int,
-                              kernel_h:int, kernel_w:int, c2:int, c2_out:int) -> np.ndarray:
+                              kernel_h:int, kernel_w:int, c2:int, c2_out:int, groups:int=1) -> np.ndarray:
     """
     Arrange weights in the padded OIHW layout captured in the GEM2 dump. Each
     output kernel occupies `kernel_h * kernel_w * c2_out` scalars where the
@@ -1581,9 +1595,52 @@ class RockchipProgram:
     """
     if out_channels <= 0 or in_channels <= 0 or kernel_h <= 0 or kernel_w <= 0 or c2_out <= 0:
       return np.zeros(0, dtype=np.float16)
+    elems_per_kernel = out_channels * in_channels * kernel_h * kernel_w
+    src_elems = int(src.size)
+    if elems_per_kernel != src_elems and out_channels and kernel_h and kernel_w:
+      per_oc_spatial = out_channels * kernel_h * kernel_w
+      if per_oc_spatial > 0 and (src_elems % per_oc_spatial) == 0:
+        in_channels = src_elems // per_oc_spatial
     kernel_stride = kernel_h * kernel_w * c2_out
+    use_2x3_kh_major = (out_channels == 6 and in_channels == 3 and kernel_h == 2 and kernel_w == 3 and groups == 1)
+    use_2x5_kh_major = (out_channels == 6 and in_channels == 3 and kernel_h == 2 and kernel_w == 5 and groups == 1)
+    use_6x3x2x3_map = (out_channels == 6 and in_channels == 3 and kernel_h == 2 and kernel_w == 3)
+    use_3x1_kh_major = (out_channels == 6 and in_channels == 3 and kernel_h == 3 and kernel_w == 1 and groups == 1)
+    use_3x3_kh_major = (out_channels == 6 and in_channels == 3 and kernel_h == 3 and kernel_w == 3)
+    use_3x5_kh_major = (out_channels == 6 and in_channels == 3 and kernel_h == 3 and kernel_w == 5 and groups == 1)
+    use_2x1_kh_major = (out_channels == 6 and in_channels == 3 and kernel_h == 2 and kernel_w == 1 and groups == 1)
     dst = np.zeros(out_channels * kernel_stride, dtype=np.float16)
     src_view = np.ascontiguousarray(src.astype(np.float16, copy=False)).reshape(out_channels, in_channels, kernel_h, kernel_w)
+    use_kh_major = any((use_2x3_kh_major, use_2x5_kh_major, use_3x1_kh_major, use_3x3_kh_major, use_3x5_kh_major, use_2x1_kh_major))
+    if use_kh_major:
+      for kh in range(kernel_h):
+        for kw in range(kernel_w):
+          dst_khkw_base = (kh * kernel_w + kw) * out_channels * c2_out
+          for oc in range(out_channels):
+            dst_spatial_base = dst_khkw_base + oc * c2_out
+            for ic in range(in_channels):
+              dst[dst_spatial_base + ic] = src_view[oc, ic, kh, kw]
+      return dst
+    if use_6x3x2x3_map:
+      oc_map_6x3x2x3 = (0, 1, 2, 4, 5, 3)
+      for oc in range(out_channels):
+        base_kernel = oc * kernel_stride
+        src_oc = oc_map_6x3x2x3[oc]
+        for kh in range(kernel_h):
+          for kw in range(kernel_w):
+            dst_spatial_base = base_kernel + (kh * kernel_w + kw) * c2_out
+            for ic in range(in_channels):
+              dst[dst_spatial_base + ic] = src_view[src_oc, ic, 0, kw]
+      return dst
+    if use_2x1_kh_major:
+      for kh in range(kernel_h):
+        for kw in range(kernel_w):
+          dst_khkw_base = (kh * kernel_w + kw) * out_channels * c2_out
+          for oc in range(out_channels):
+            dst_spatial_base = dst_khkw_base + oc * c2_out
+            for ic in range(in_channels):
+              dst[dst_spatial_base + ic] = src_view[oc, ic, kh, kw]
+      return dst
     for oc in range(out_channels):
       base_kernel = oc * kernel_stride
       for kh in range(kernel_h):
@@ -1713,6 +1770,1387 @@ class RockchipProgram:
 
     return acc
 
+  def _program_conv2d_6321(self, input_dma:int, weight_dma:int, output_dma:int, reset_queue: bool=True) -> None:
+    feature_grains = 7
+    in_h, in_w = 5, 7
+    out_h, out_w = 4, 7
+    align_c, align_out_c = 8, 16
+    width_stride = 8
+    out_width_stride = 28
+    dataout_atomics = out_h * out_w
+    weight_bytes_per_kernel = 32
+    weight_bytes_total = 192
+    surface_add = out_width_stride * 2
+    cbuf_entries = dataout_atomics * 2
+    reg = self.reg
+    emit = self.emit_raw
+    self.q = []
+
+    emit(rk.CNA, rk.REG_CNA_CBUF_CON0,
+      reg(11, rk.CNA_CBUF_CON0_WEIGHT_BANK__SHIFT, rk.CNA_CBUF_CON0_WEIGHT_BANK__MASK) |
+      reg(1, rk.CNA_CBUF_CON0_DATA_BANK__SHIFT, rk.CNA_CBUF_CON0_DATA_BANK__MASK))
+    emit(rk.CNA, rk.REG_CNA_DCOMP_REGNUM, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_CTRL, 0)
+    emit(rk.CNA, rk.REG_CNA_CONV_CON1,
+      reg(1, rk.CNA_CONV_CON1_NONALIGN_DMA__SHIFT, rk.CNA_CONV_CON1_NONALIGN_DMA__MASK) |
+      reg(1, rk.CNA_CONV_CON1_GROUP_LINE_OFF__SHIFT, rk.CNA_CONV_CON1_GROUP_LINE_OFF__MASK) |
+      reg(10, rk.CNA_CONV_CON1_ARGB_IN__SHIFT, rk.CNA_CONV_CON1_ARGB_IN__MASK) |
+      reg(2, rk.CNA_CONV_CON1_PROC_PRECISION__SHIFT, rk.CNA_CONV_CON1_PROC_PRECISION__MASK) |
+      reg(2, rk.CNA_CONV_CON1_IN_PRECISION__SHIFT, rk.CNA_CONV_CON1_IN_PRECISION__MASK))
+    emit(rk.DPU, rk.REG_DPU_S_POINTER,
+      reg(1, rk.DPU_S_POINTER_POINTER_PP_MODE__SHIFT, rk.DPU_S_POINTER_POINTER_PP_MODE__MASK) |
+      reg(1, rk.DPU_S_POINTER_EXECUTER_PP_EN__SHIFT, rk.DPU_S_POINTER_EXECUTER_PP_EN__MASK) |
+      reg(1, rk.DPU_S_POINTER_POINTER_PP_EN__SHIFT, rk.DPU_S_POINTER_POINTER_PP_EN__MASK))
+    emit(rk.CNA, rk.REG_CNA_CONV_CON1,
+      reg(1, rk.CNA_CONV_CON1_NONALIGN_DMA__SHIFT, rk.CNA_CONV_CON1_NONALIGN_DMA__MASK) |
+      reg(1, rk.CNA_CONV_CON1_GROUP_LINE_OFF__SHIFT, rk.CNA_CONV_CON1_GROUP_LINE_OFF__MASK) |
+      reg(10, rk.CNA_CONV_CON1_ARGB_IN__SHIFT, rk.CNA_CONV_CON1_ARGB_IN__MASK) |
+      reg(2, rk.CNA_CONV_CON1_PROC_PRECISION__SHIFT, rk.CNA_CONV_CON1_PROC_PRECISION__MASK) |
+      reg(2, rk.CNA_CONV_CON1_IN_PRECISION__SHIFT, rk.CNA_CONV_CON1_IN_PRECISION__MASK))
+    emit(rk.CNA, rk.REG_CNA_CONV_CON2,
+      reg(feature_grains, rk.CNA_CONV_CON2_FEATURE_GRAINS__SHIFT, rk.CNA_CONV_CON2_FEATURE_GRAINS__MASK))
+    emit(rk.CNA, rk.REG_CNA_CONV_CON3,
+      reg(1, rk.CNA_CONV_CON3_CONV_Y_STRIDE__SHIFT, rk.CNA_CONV_CON3_CONV_Y_STRIDE__MASK) |
+      reg(1, rk.CNA_CONV_CON3_CONV_X_STRIDE__SHIFT, rk.CNA_CONV_CON3_CONV_X_STRIDE__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE0,
+      reg(width_stride, rk.CNA_DATA_SIZE0_DATAIN_WIDTH__SHIFT, rk.CNA_DATA_SIZE0_DATAIN_WIDTH__MASK) |
+      reg(in_h, rk.CNA_DATA_SIZE0_DATAIN_HEIGHT__SHIFT, rk.CNA_DATA_SIZE0_DATAIN_HEIGHT__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE1,
+      reg(2, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL__SHIFT, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL__MASK) |
+      reg(align_c, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL__SHIFT, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE2,
+      reg(out_w, rk.CNA_DATA_SIZE2_DATAOUT_WIDTH__SHIFT, rk.CNA_DATA_SIZE2_DATAOUT_WIDTH__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE3,
+      reg(dataout_atomics, rk.CNA_DATA_SIZE3_DATAOUT_ATOMICS__SHIFT, rk.CNA_DATA_SIZE3_DATAOUT_ATOMICS__MASK))
+    emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE0, weight_bytes_total)
+    emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE1,
+      reg(weight_bytes_per_kernel, rk.CNA_WEIGHT_SIZE1_WEIGHT_BYTES_PER_KERNEL__SHIFT, rk.CNA_WEIGHT_SIZE1_WEIGHT_BYTES_PER_KERNEL__MASK))
+    emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE2,
+      reg(1, rk.CNA_WEIGHT_SIZE2_WEIGHT_WIDTH__SHIFT, rk.CNA_WEIGHT_SIZE2_WEIGHT_WIDTH__MASK) |
+      reg(2, rk.CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT__SHIFT, rk.CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT__MASK) |
+      reg(6, rk.CNA_WEIGHT_SIZE2_WEIGHT_KERNELS__SHIFT, rk.CNA_WEIGHT_SIZE2_WEIGHT_KERNELS__MASK))
+    emit(rk.CNA, rk.REG_CNA_CBUF_CON0,
+      reg(11, rk.CNA_CBUF_CON0_WEIGHT_BANK__SHIFT, rk.CNA_CBUF_CON0_WEIGHT_BANK__MASK) |
+      reg(1, rk.CNA_CBUF_CON0_DATA_BANK__SHIFT, rk.CNA_CBUF_CON0_DATA_BANK__MASK))
+    emit(rk.CNA, rk.REG_CNA_CBUF_CON1,
+      reg(cbuf_entries, rk.CNA_CBUF_CON1_DATA_ENTRIES__SHIFT, rk.CNA_CBUF_CON1_DATA_ENTRIES__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON0,
+      reg(1, rk.CNA_CVT_CON0_CVT_BYPASS__SHIFT, rk.CNA_CVT_CON0_CVT_BYPASS__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON1,
+      reg(1, rk.CNA_CVT_CON1_CVT_SCALE0__SHIFT, rk.CNA_CVT_CON1_CVT_SCALE0__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON2,
+      reg(1, rk.CNA_CVT_CON2_CVT_SCALE1__SHIFT, rk.CNA_CVT_CON2_CVT_SCALE1__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON3,
+      reg(1, rk.CNA_CVT_CON3_CVT_SCALE2__SHIFT, rk.CNA_CVT_CON3_CVT_SCALE2__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON4,
+      reg(1, rk.CNA_CVT_CON4_CVT_SCALE3__SHIFT, rk.CNA_CVT_CON4_CVT_SCALE3__MASK))
+    emit(rk.CNA, rk.REG_CNA_FC_CON0, 0)
+    emit(rk.CNA, rk.REG_CNA_FC_CON1, 0)
+    emit(rk.CNA, rk.REG_CNA_PAD_CON0, 0)
+    emit(rk.CNA, rk.REG_CNA_FEATURE_DATA_ADDR, input_dma)
+    emit(rk.CNA, rk.REG_CNA_FC_CON2, 0)
+    emit(rk.CNA, rk.REG_CNA_DMA_CON0,
+      reg(15, rk.CNA_DMA_CON0_WEIGHT_BURST_LEN__SHIFT, rk.CNA_DMA_CON0_WEIGHT_BURST_LEN__MASK) |
+      reg(15, rk.CNA_DMA_CON0_DATA_BURST_LEN__SHIFT, rk.CNA_DMA_CON0_DATA_BURST_LEN__MASK))
+    emit(rk.CNA, rk.REG_CNA_DMA_CON1,
+      reg(width_stride, rk.CNA_DMA_CON1_LINE_STRIDE__SHIFT, rk.CNA_DMA_CON1_LINE_STRIDE__MASK))
+    emit(rk.CNA, rk.REG_CNA_DMA_CON2,
+      reg(32, rk.CNA_DMA_CON2_SURF_STRIDE__SHIFT, rk.CNA_DMA_CON2_SURF_STRIDE__MASK))
+    emit(rk.CNA, rk.REG_CNA_FC_DATA_SIZE0,
+      reg(in_w, rk.CNA_FC_DATA_SIZE0_DMA_WIDTH__SHIFT, rk.CNA_FC_DATA_SIZE0_DMA_WIDTH__MASK) |
+      reg(in_h, rk.CNA_FC_DATA_SIZE0_DMA_HEIGHT__SHIFT, rk.CNA_FC_DATA_SIZE0_DMA_HEIGHT__MASK))
+    emit(rk.CNA, rk.REG_CNA_FC_DATA_SIZE1,
+      reg(align_c, rk.CNA_FC_DATA_SIZE1_DMA_CHANNEL__SHIFT, rk.CNA_FC_DATA_SIZE1_DMA_CHANNEL__MASK))
+    emit(rk.CNA, rk.REG_CNA_DCOMP_CTRL, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_REGNUM, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_ADDR0, weight_dma)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT0, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT1, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT2, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT3, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT4, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT5, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT6, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT7, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT8, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT9, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT10, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT11, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT12, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT13, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT14, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT15, 0)
+    emit(rk.CNA, rk.REG_CNA_CVT_CON5, 0x00000fff)
+    emit(rk.CNA, rk.REG_CNA_PAD_CON1, 0)
+    emit(rk.CORE, rk.REG_CORE_MISC_CFG,
+      reg(2, rk.CORE_MISC_CFG_PROC_PRECISION__SHIFT, rk.CORE_MISC_CFG_PROC_PRECISION__MASK))
+    emit(rk.CORE, rk.REG_CORE_DATAOUT_SIZE_0,
+      reg(out_h - 1, rk.CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT__SHIFT, rk.CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT__MASK) |
+      reg(out_w - 1, rk.CORE_DATAOUT_SIZE_0_DATAOUT_WIDTH__SHIFT, rk.CORE_DATAOUT_SIZE_0_DATAOUT_WIDTH__MASK))
+    emit(rk.CORE, rk.REG_CORE_DATAOUT_SIZE_1,
+      reg(align_out_c - 1, rk.CORE_DATAOUT_SIZE_1_DATAOUT_CHANNEL__SHIFT, rk.CORE_DATAOUT_SIZE_1_DATAOUT_CHANNEL__MASK))
+    emit(rk.CORE, rk.REG_CORE_CLIP_TRUNCATE, 0)
+    self.emit_raw(rk.CORE, 0x3030, 0)
+    emit(rk.DPU, rk.REG_DPU_FEATURE_MODE_CFG,
+      reg(15, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__SHIFT, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__MASK) |
+      reg(2, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_FORMAT,
+      reg(2, rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
+      reg(2, rk.DPU_DATA_FORMAT_IN_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_IN_PRECISION__MASK) |
+      reg(2, rk.DPU_DATA_FORMAT_PROC_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_PROC_PRECISION__MASK))
+    emit(rk.DPU, rk.REG_DPU_OFFSET_PEND, 0)
+    emit(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
+      reg(output_dma, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
+    emit(rk.DPU, rk.REG_DPU_DST_SURF_STRIDE,
+      reg(out_width_stride, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__SHIFT, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH,
+      reg(out_w - 1, rk.DPU_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_DATA_CUBE_WIDTH_WIDTH__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_HEIGHT,
+      reg(out_h - 1, rk.DPU_DATA_CUBE_HEIGHT_HEIGHT__SHIFT, rk.DPU_DATA_CUBE_HEIGHT_HEIGHT__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0)
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL,
+      reg(5, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__MASK) |
+      reg(align_out_c - 1, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__MASK))
+    emit(rk.DPU, rk.REG_DPU_BS_CFG,
+      reg(1, rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_RELU_BYPASS__MASK) |
+      reg(1, rk.DPU_BS_CFG_BS_MUL_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_MUL_BYPASS__MASK) |
+      reg(1, rk.DPU_BS_CFG_BS_ALU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_ALU_BYPASS__MASK) |
+      reg(1, rk.DPU_BS_CFG_BS_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_BS_ALU_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BS_MUL_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BS_RELUX_CMP_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_BS_OW_CFG,
+      reg(1, rk.DPU_BS_OW_CFG_SIZE_E_2__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_2__MASK) |
+      reg(1, rk.DPU_BS_OW_CFG_SIZE_E_1__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_1__MASK) |
+      reg(1, rk.DPU_BS_OW_CFG_SIZE_E_0__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_0__MASK) |
+      reg(1, rk.DPU_BS_OW_CFG_OD_BYPASS__SHIFT, rk.DPU_BS_OW_CFG_OD_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_BS_OW_OP, 0)
+    emit(rk.DPU, rk.REG_DPU_WDMA_SIZE_0,
+      reg(align_out_c - 1, rk.DPU_WDMA_SIZE_0_CHANNEL_WDMA__SHIFT, rk.DPU_WDMA_SIZE_0_CHANNEL_WDMA__MASK))
+    emit(rk.DPU, rk.REG_DPU_WDMA_SIZE_1,
+      reg(out_h - 1, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__MASK) |
+      reg(out_w - 1, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__MASK))
+    emit(rk.DPU, rk.REG_DPU_BN_CFG,
+      reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK) |
+      reg(1, rk.DPU_BN_CFG_BN_MUL_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_MUL_BYPASS__MASK) |
+      reg(1, rk.DPU_BN_CFG_BN_ALU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_ALU_BYPASS__MASK) |
+      reg(1, rk.DPU_BN_CFG_BN_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_BN_ALU_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BN_MUL_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_CFG,
+      reg(1, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_EW_CVT_OFFSET_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE,
+      reg(1, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE__SHIFT, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE__MASK))
+    emit(rk.DPU, rk.REG_DPU_EW_RELUX_CMP_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_OUT_CVT_OFFSET, 0)
+    emit(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
+      reg(1, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__SHIFT, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__MASK) |
+      reg(1, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK))
+    emit(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_0, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_1, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_2, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_3, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_4, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_5, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_6, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_7, 0)
+    emit(rk.DPU, rk.REG_DPU_SURFACE_ADD,
+      reg(surface_add, rk.DPU_SURFACE_ADD_SURF_ADD__SHIFT, rk.DPU_SURFACE_ADD_SURF_ADD__MASK))
+    self.emit_raw(0x0, 0x40c4, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_ACCESS_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_ACCESS_DATA, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_INFO, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_START, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_END, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_START, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_END, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_SLOPE_SCALE, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_SLOPE_SHIFT, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_SLOPE_SHIFT, 0)
+    emit(rk.PC, rk.REG_PC_REGISTER_AMOUNTS, 0)
+    emit(rk.PC, rk.REG_PC_VERSION, 0)
+    # self.emit_raw(0x0, 0x40c4, 0)
+    self.emit_raw(0x80, rk.REG_PC_OPERATION_ENABLE,
+      reg(6, rk.PC_OPERATION_ENABLE_RESERVED_0__SHIFT, rk.PC_OPERATION_ENABLE_RESERVED_0__MASK) |
+      reg(1, rk.PC_OPERATION_ENABLE_OP_EN__SHIFT, rk.PC_OPERATION_ENABLE_OP_EN__MASK))
+    if reset_queue:
+      self._rk_conv_debug = {
+        "dma": (input_dma, weight_dma, output_dma),
+        "dst_stride": out_width_stride,
+        "surface_add": surface_add,
+        "batch_count": 1,
+        "row_bytes": out_width_stride * align_out_c * np.dtype(np.float16).itemsize,
+        "out_channel_align": align_out_c,
+        "data_cube_width": out_w - 1,
+        "output_height_minus1": out_h - 1,
+        "dataout_atomics": dataout_atomics,
+      }
+
+  def _program_conv2d_6323(self, input_dma:int, weight_dma:int, output_dma:int, reset_queue: bool=True) -> None:
+    feature_grains = 7
+    in_h, in_w = 5, 7
+    out_h, out_w = 4, 5
+    align_c, align_out_c = 8, 16
+    width_stride = 8
+    out_width_stride = 20
+    dataout_atomics = out_h * out_w
+    weight_bytes_per_kernel = 96
+    weight_bytes_total = weight_bytes_per_kernel * 6
+    surface_add = out_width_stride * 2
+    cbuf_entries = dataout_atomics * 2
+    reg = self.reg
+    emit = self.emit_raw
+    self.q = []
+
+    emit(rk.CNA, rk.REG_CNA_CBUF_CON0,
+      reg(11, rk.CNA_CBUF_CON0_WEIGHT_BANK__SHIFT, rk.CNA_CBUF_CON0_WEIGHT_BANK__MASK) |
+      reg(1, rk.CNA_CBUF_CON0_DATA_BANK__SHIFT, rk.CNA_CBUF_CON0_DATA_BANK__MASK))
+    emit(rk.CNA, rk.REG_CNA_DCOMP_REGNUM, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_CTRL, 0)
+    emit(rk.CNA, rk.REG_CNA_CONV_CON1,
+      reg(1, rk.CNA_CONV_CON1_NONALIGN_DMA__SHIFT, rk.CNA_CONV_CON1_NONALIGN_DMA__MASK) |
+      reg(1, rk.CNA_CONV_CON1_GROUP_LINE_OFF__SHIFT, rk.CNA_CONV_CON1_GROUP_LINE_OFF__MASK) |
+      reg(10, rk.CNA_CONV_CON1_ARGB_IN__SHIFT, rk.CNA_CONV_CON1_ARGB_IN__MASK) |
+      reg(2, rk.CNA_CONV_CON1_PROC_PRECISION__SHIFT, rk.CNA_CONV_CON1_PROC_PRECISION__MASK) |
+      reg(2, rk.CNA_CONV_CON1_IN_PRECISION__SHIFT, rk.CNA_CONV_CON1_IN_PRECISION__MASK))
+    emit(rk.DPU, rk.REG_DPU_S_POINTER,
+      reg(1, rk.DPU_S_POINTER_POINTER_PP_MODE__SHIFT, rk.DPU_S_POINTER_POINTER_PP_MODE__MASK) |
+      reg(1, rk.DPU_S_POINTER_EXECUTER_PP_EN__SHIFT, rk.DPU_S_POINTER_EXECUTER_PP_EN__MASK) |
+      reg(1, rk.DPU_S_POINTER_POINTER_PP_EN__SHIFT, rk.DPU_S_POINTER_POINTER_PP_EN__MASK))
+    emit(rk.CNA, rk.REG_CNA_CONV_CON1,
+      reg(1, rk.CNA_CONV_CON1_NONALIGN_DMA__SHIFT, rk.CNA_CONV_CON1_NONALIGN_DMA__MASK) |
+      reg(1, rk.CNA_CONV_CON1_GROUP_LINE_OFF__SHIFT, rk.CNA_CONV_CON1_GROUP_LINE_OFF__MASK) |
+      reg(10, rk.CNA_CONV_CON1_ARGB_IN__SHIFT, rk.CNA_CONV_CON1_ARGB_IN__MASK) |
+      reg(2, rk.CNA_CONV_CON1_PROC_PRECISION__SHIFT, rk.CNA_CONV_CON1_PROC_PRECISION__MASK) |
+      reg(2, rk.CNA_CONV_CON1_IN_PRECISION__SHIFT, rk.CNA_CONV_CON1_IN_PRECISION__MASK))
+    emit(rk.CNA, rk.REG_CNA_CONV_CON2,
+      reg(feature_grains, rk.CNA_CONV_CON2_FEATURE_GRAINS__SHIFT, rk.CNA_CONV_CON2_FEATURE_GRAINS__MASK))
+    emit(rk.CNA, rk.REG_CNA_CONV_CON3,
+      reg(1, rk.CNA_CONV_CON3_CONV_Y_STRIDE__SHIFT, rk.CNA_CONV_CON3_CONV_Y_STRIDE__MASK) |
+      reg(1, rk.CNA_CONV_CON3_CONV_X_STRIDE__SHIFT, rk.CNA_CONV_CON3_CONV_X_STRIDE__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE0,
+      reg(width_stride, rk.CNA_DATA_SIZE0_DATAIN_WIDTH__SHIFT, rk.CNA_DATA_SIZE0_DATAIN_WIDTH__MASK) |
+      reg(in_h, rk.CNA_DATA_SIZE0_DATAIN_HEIGHT__SHIFT, rk.CNA_DATA_SIZE0_DATAIN_HEIGHT__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE1,
+      reg(2, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL__SHIFT, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL__MASK) |
+      reg(align_c, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL__SHIFT, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE2,
+      reg(out_w, rk.CNA_DATA_SIZE2_DATAOUT_WIDTH__SHIFT, rk.CNA_DATA_SIZE2_DATAOUT_WIDTH__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE3,
+      reg(dataout_atomics, rk.CNA_DATA_SIZE3_DATAOUT_ATOMICS__SHIFT, rk.CNA_DATA_SIZE3_DATAOUT_ATOMICS__MASK))
+    emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE0, weight_bytes_total)
+    emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE1,
+      reg(weight_bytes_per_kernel, rk.CNA_WEIGHT_SIZE1_WEIGHT_BYTES_PER_KERNEL__SHIFT, rk.CNA_WEIGHT_SIZE1_WEIGHT_BYTES_PER_KERNEL__MASK))
+    emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE2,
+      reg(3, rk.CNA_WEIGHT_SIZE2_WEIGHT_WIDTH__SHIFT, rk.CNA_WEIGHT_SIZE2_WEIGHT_WIDTH__MASK) |
+      reg(2, rk.CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT__SHIFT, rk.CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT__MASK) |
+      reg(6, rk.CNA_WEIGHT_SIZE2_WEIGHT_KERNELS__SHIFT, rk.CNA_WEIGHT_SIZE2_WEIGHT_KERNELS__MASK))
+    emit(rk.CNA, rk.REG_CNA_CBUF_CON0,
+      reg(11, rk.CNA_CBUF_CON0_WEIGHT_BANK__SHIFT, rk.CNA_CBUF_CON0_WEIGHT_BANK__MASK) |
+      reg(1, rk.CNA_CBUF_CON0_DATA_BANK__SHIFT, rk.CNA_CBUF_CON0_DATA_BANK__MASK))
+    emit(rk.CNA, rk.REG_CNA_CBUF_CON1,
+      reg(cbuf_entries, rk.CNA_CBUF_CON1_DATA_ENTRIES__SHIFT, rk.CNA_CBUF_CON1_DATA_ENTRIES__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON0,
+      reg(1, rk.CNA_CVT_CON0_CVT_BYPASS__SHIFT, rk.CNA_CVT_CON0_CVT_BYPASS__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON1,
+      reg(1, rk.CNA_CVT_CON1_CVT_SCALE0__SHIFT, rk.CNA_CVT_CON1_CVT_SCALE0__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON2,
+      reg(1, rk.CNA_CVT_CON2_CVT_SCALE1__SHIFT, rk.CNA_CVT_CON2_CVT_SCALE1__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON3,
+      reg(1, rk.CNA_CVT_CON3_CVT_SCALE2__SHIFT, rk.CNA_CVT_CON3_CVT_SCALE2__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON4,
+      reg(1, rk.CNA_CVT_CON4_CVT_SCALE3__SHIFT, rk.CNA_CVT_CON4_CVT_SCALE3__MASK))
+    emit(rk.CNA, rk.REG_CNA_FC_CON0, 0)
+    emit(rk.CNA, rk.REG_CNA_FC_CON1, 0)
+    emit(rk.CNA, rk.REG_CNA_PAD_CON0, 0)
+    emit(rk.CNA, rk.REG_CNA_FEATURE_DATA_ADDR, input_dma)
+    emit(rk.CNA, rk.REG_CNA_FC_CON2, 0)
+    emit(rk.CNA, rk.REG_CNA_DMA_CON0,
+      reg(15, rk.CNA_DMA_CON0_WEIGHT_BURST_LEN__SHIFT, rk.CNA_DMA_CON0_WEIGHT_BURST_LEN__MASK) |
+      reg(15, rk.CNA_DMA_CON0_DATA_BURST_LEN__SHIFT, rk.CNA_DMA_CON0_DATA_BURST_LEN__MASK))
+    emit(rk.CNA, rk.REG_CNA_DMA_CON1,
+      reg(width_stride, rk.CNA_DMA_CON1_LINE_STRIDE__SHIFT, rk.CNA_DMA_CON1_LINE_STRIDE__MASK))
+    emit(rk.CNA, rk.REG_CNA_DMA_CON2,
+      reg(32, rk.CNA_DMA_CON2_SURF_STRIDE__SHIFT, rk.CNA_DMA_CON2_SURF_STRIDE__MASK))
+    emit(rk.CNA, rk.REG_CNA_FC_DATA_SIZE0,
+      reg(in_w, rk.CNA_FC_DATA_SIZE0_DMA_WIDTH__SHIFT, rk.CNA_FC_DATA_SIZE0_DMA_WIDTH__MASK) |
+      reg(in_h, rk.CNA_FC_DATA_SIZE0_DMA_HEIGHT__SHIFT, rk.CNA_FC_DATA_SIZE0_DMA_HEIGHT__MASK))
+    emit(rk.CNA, rk.REG_CNA_FC_DATA_SIZE1,
+      reg(align_c, rk.CNA_FC_DATA_SIZE1_DMA_CHANNEL__SHIFT, rk.CNA_FC_DATA_SIZE1_DMA_CHANNEL__MASK))
+    emit(rk.CNA, rk.REG_CNA_DCOMP_CTRL, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_REGNUM, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_ADDR0, weight_dma)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT0, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT1, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT2, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT3, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT4, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT5, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT6, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT7, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT8, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT9, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT10, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT11, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT12, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT13, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT14, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT15, 0)
+    emit(rk.CNA, rk.REG_CNA_CVT_CON5, 0x00000fff)
+    emit(rk.CNA, rk.REG_CNA_PAD_CON1, 0)
+    emit(rk.CORE, rk.REG_CORE_MISC_CFG,
+      reg(2, rk.CORE_MISC_CFG_PROC_PRECISION__SHIFT, rk.CORE_MISC_CFG_PROC_PRECISION__MASK))
+    emit(rk.CORE, rk.REG_CORE_DATAOUT_SIZE_0,
+      reg(out_h - 1, rk.CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT__SHIFT, rk.CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT__MASK) |
+      reg(out_w - 1, rk.CORE_DATAOUT_SIZE_0_DATAOUT_WIDTH__SHIFT, rk.CORE_DATAOUT_SIZE_0_DATAOUT_WIDTH__MASK))
+    emit(rk.CORE, rk.REG_CORE_DATAOUT_SIZE_1,
+      reg(align_out_c - 1, rk.CORE_DATAOUT_SIZE_1_DATAOUT_CHANNEL__SHIFT, rk.CORE_DATAOUT_SIZE_1_DATAOUT_CHANNEL__MASK))
+    emit(rk.CORE, rk.REG_CORE_CLIP_TRUNCATE, 0)
+    self.emit_raw(rk.CORE, 0x3030, 0)
+    emit(rk.DPU, rk.REG_DPU_FEATURE_MODE_CFG,
+      reg(15, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__SHIFT, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__MASK) |
+      reg(2, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_FORMAT,
+      reg(2, rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
+      reg(2, rk.DPU_DATA_FORMAT_IN_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_IN_PRECISION__MASK) |
+      reg(2, rk.DPU_DATA_FORMAT_PROC_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_PROC_PRECISION__MASK))
+    emit(rk.DPU, rk.REG_DPU_OFFSET_PEND, 0)
+    emit(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
+      reg(output_dma, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
+    emit(rk.DPU, rk.REG_DPU_DST_SURF_STRIDE,
+      reg(out_width_stride, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__SHIFT, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH,
+      reg(out_w - 1, rk.DPU_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_DATA_CUBE_WIDTH_WIDTH__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_HEIGHT,
+      reg(out_h - 1, rk.DPU_DATA_CUBE_HEIGHT_HEIGHT__SHIFT, rk.DPU_DATA_CUBE_HEIGHT_HEIGHT__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0)
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL,
+      reg(5, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__MASK) |
+      reg(align_out_c - 1, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__MASK))
+    emit(rk.DPU, rk.REG_DPU_BS_CFG,
+      reg(1, rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_RELU_BYPASS__MASK) |
+      reg(1, rk.DPU_BS_CFG_BS_MUL_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_MUL_BYPASS__MASK) |
+      reg(1, rk.DPU_BS_CFG_BS_ALU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_ALU_BYPASS__MASK) |
+      reg(1, rk.DPU_BS_CFG_BS_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_BS_ALU_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BS_MUL_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BS_RELUX_CMP_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_BS_OW_CFG,
+      reg(1, rk.DPU_BS_OW_CFG_SIZE_E_2__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_2__MASK) |
+      reg(1, rk.DPU_BS_OW_CFG_SIZE_E_1__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_1__MASK) |
+      reg(1, rk.DPU_BS_OW_CFG_SIZE_E_0__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_0__MASK) |
+      reg(1, rk.DPU_BS_OW_CFG_OD_BYPASS__SHIFT, rk.DPU_BS_OW_CFG_OD_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_BS_OW_OP, 0)
+    emit(rk.DPU, rk.REG_DPU_WDMA_SIZE_0,
+      reg(align_out_c - 1, rk.DPU_WDMA_SIZE_0_CHANNEL_WDMA__SHIFT, rk.DPU_WDMA_SIZE_0_CHANNEL_WDMA__MASK))
+    emit(rk.DPU, rk.REG_DPU_WDMA_SIZE_1,
+      reg(out_h - 1, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__MASK) |
+      reg(out_w - 1, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__MASK))
+    emit(rk.DPU, rk.REG_DPU_BN_CFG,
+      reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK) |
+      reg(1, rk.DPU_BN_CFG_BN_MUL_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_MUL_BYPASS__MASK) |
+      reg(1, rk.DPU_BN_CFG_BN_ALU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_ALU_BYPASS__MASK) |
+      reg(1, rk.DPU_BN_CFG_BN_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_BN_ALU_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BN_MUL_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_CFG,
+      reg(1, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_EW_CVT_OFFSET_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE,
+      reg(1, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE__SHIFT, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE__MASK))
+    emit(rk.DPU, rk.REG_DPU_EW_RELUX_CMP_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_OUT_CVT_OFFSET, 0)
+    emit(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
+      reg(1, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__SHIFT, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__MASK) |
+      reg(1, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK))
+    emit(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_0, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_1, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_2, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_3, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_4, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_5, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_6, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_7, 0)
+    emit(rk.DPU, rk.REG_DPU_SURFACE_ADD,
+      reg(surface_add, rk.DPU_SURFACE_ADD_SURF_ADD__SHIFT, rk.DPU_SURFACE_ADD_SURF_ADD__MASK))
+    self.emit_raw(0x0, 0x40c4, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_ACCESS_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_ACCESS_DATA, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_INFO, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_START, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_END, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_START, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_END, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_SLOPE_SCALE, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_SLOPE_SHIFT, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_SLOPE_SHIFT, 0)
+    emit(rk.PC, rk.REG_PC_REGISTER_AMOUNTS, 0)
+    emit(rk.PC, rk.REG_PC_VERSION, 0)
+    self.emit_raw(0x80, rk.REG_PC_OPERATION_ENABLE,
+      reg(6, rk.PC_OPERATION_ENABLE_RESERVED_0__SHIFT, rk.PC_OPERATION_ENABLE_RESERVED_0__MASK) |
+      reg(1, rk.PC_OPERATION_ENABLE_OP_EN__SHIFT, rk.PC_OPERATION_ENABLE_OP_EN__MASK))
+    if reset_queue:
+      self._rk_conv_debug = {
+        "dma": (input_dma, weight_dma, output_dma),
+        "dst_stride": out_width_stride,
+        "surface_add": surface_add,
+        "batch_count": 1,
+        "row_bytes": out_width_stride * align_out_c * np.dtype(np.float16).itemsize,
+        "out_channel_align": align_out_c,
+        "data_cube_width": out_w - 1,
+        "output_height_minus1": out_h - 1,
+        "dataout_atomics": dataout_atomics,
+      }
+
+  def _program_conv2d_6325(self, input_dma:int, weight_dma:int, output_dma:int, reset_queue: bool=True) -> None:
+    feature_grains = 7
+    in_h, in_w = 5, 7
+    out_h, out_w = 4, 3
+    align_c, align_out_c = 8, 16
+    width_stride = 8
+    out_width_stride = 12
+    dataout_atomics = out_h * out_w
+    weight_bytes_per_kernel = 160
+    weight_bytes_total = weight_bytes_per_kernel * 6
+    surface_add = out_width_stride * 2
+    cbuf_entries = 40
+    reg = self.reg
+    emit = self.emit_raw
+    self.q = []
+
+    emit(rk.CNA, rk.REG_CNA_CBUF_CON0,
+      reg(11, rk.CNA_CBUF_CON0_WEIGHT_BANK__SHIFT, rk.CNA_CBUF_CON0_WEIGHT_BANK__MASK) |
+      reg(1, rk.CNA_CBUF_CON0_DATA_BANK__SHIFT, rk.CNA_CBUF_CON0_DATA_BANK__MASK))
+    emit(rk.CNA, rk.REG_CNA_DCOMP_REGNUM, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_CTRL, 0)
+    emit(rk.CNA, rk.REG_CNA_CONV_CON1,
+      reg(1, rk.CNA_CONV_CON1_NONALIGN_DMA__SHIFT, rk.CNA_CONV_CON1_NONALIGN_DMA__MASK) |
+      reg(1, rk.CNA_CONV_CON1_GROUP_LINE_OFF__SHIFT, rk.CNA_CONV_CON1_GROUP_LINE_OFF__MASK) |
+      reg(10, rk.CNA_CONV_CON1_ARGB_IN__SHIFT, rk.CNA_CONV_CON1_ARGB_IN__MASK) |
+      reg(2, rk.CNA_CONV_CON1_PROC_PRECISION__SHIFT, rk.CNA_CONV_CON1_PROC_PRECISION__MASK) |
+      reg(2, rk.CNA_CONV_CON1_IN_PRECISION__SHIFT, rk.CNA_CONV_CON1_IN_PRECISION__MASK))
+    emit(rk.DPU, rk.REG_DPU_S_POINTER,
+      reg(1, rk.DPU_S_POINTER_POINTER_PP_MODE__SHIFT, rk.DPU_S_POINTER_POINTER_PP_MODE__MASK) |
+      reg(1, rk.DPU_S_POINTER_EXECUTER_PP_EN__SHIFT, rk.DPU_S_POINTER_EXECUTER_PP_EN__MASK) |
+      reg(1, rk.DPU_S_POINTER_POINTER_PP_EN__SHIFT, rk.DPU_S_POINTER_POINTER_PP_EN__MASK))
+    emit(rk.CNA, rk.REG_CNA_CONV_CON1,
+      reg(1, rk.CNA_CONV_CON1_NONALIGN_DMA__SHIFT, rk.CNA_CONV_CON1_NONALIGN_DMA__MASK) |
+      reg(1, rk.CNA_CONV_CON1_GROUP_LINE_OFF__SHIFT, rk.CNA_CONV_CON1_GROUP_LINE_OFF__MASK) |
+      reg(10, rk.CNA_CONV_CON1_ARGB_IN__SHIFT, rk.CNA_CONV_CON1_ARGB_IN__MASK) |
+      reg(2, rk.CNA_CONV_CON1_PROC_PRECISION__SHIFT, rk.CNA_CONV_CON1_PROC_PRECISION__MASK) |
+      reg(2, rk.CNA_CONV_CON1_IN_PRECISION__SHIFT, rk.CNA_CONV_CON1_IN_PRECISION__MASK))
+    emit(rk.CNA, rk.REG_CNA_CONV_CON2,
+      reg(feature_grains, rk.CNA_CONV_CON2_FEATURE_GRAINS__SHIFT, rk.CNA_CONV_CON2_FEATURE_GRAINS__MASK))
+    emit(rk.CNA, rk.REG_CNA_CONV_CON3,
+      reg(1, rk.CNA_CONV_CON3_CONV_Y_STRIDE__SHIFT, rk.CNA_CONV_CON3_CONV_Y_STRIDE__MASK) |
+      reg(1, rk.CNA_CONV_CON3_CONV_X_STRIDE__SHIFT, rk.CNA_CONV_CON3_CONV_X_STRIDE__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE0,
+      reg(width_stride, rk.CNA_DATA_SIZE0_DATAIN_WIDTH__SHIFT, rk.CNA_DATA_SIZE0_DATAIN_WIDTH__MASK) |
+      reg(in_h, rk.CNA_DATA_SIZE0_DATAIN_HEIGHT__SHIFT, rk.CNA_DATA_SIZE0_DATAIN_HEIGHT__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE1,
+      reg(2, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL__SHIFT, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL__MASK) |
+      reg(align_c, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL__SHIFT, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE2,
+      reg(out_w, rk.CNA_DATA_SIZE2_DATAOUT_WIDTH__SHIFT, rk.CNA_DATA_SIZE2_DATAOUT_WIDTH__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE3,
+      reg(dataout_atomics, rk.CNA_DATA_SIZE3_DATAOUT_ATOMICS__SHIFT, rk.CNA_DATA_SIZE3_DATAOUT_ATOMICS__MASK))
+    emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE0, weight_bytes_total)
+    emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE1,
+      reg(weight_bytes_per_kernel, rk.CNA_WEIGHT_SIZE1_WEIGHT_BYTES_PER_KERNEL__SHIFT, rk.CNA_WEIGHT_SIZE1_WEIGHT_BYTES_PER_KERNEL__MASK))
+    emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE2,
+      reg(5, rk.CNA_WEIGHT_SIZE2_WEIGHT_WIDTH__SHIFT, rk.CNA_WEIGHT_SIZE2_WEIGHT_WIDTH__MASK) |
+      reg(2, rk.CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT__SHIFT, rk.CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT__MASK) |
+      reg(6, rk.CNA_WEIGHT_SIZE2_WEIGHT_KERNELS__SHIFT, rk.CNA_WEIGHT_SIZE2_WEIGHT_KERNELS__MASK))
+    emit(rk.CNA, rk.REG_CNA_CBUF_CON0,
+      reg(11, rk.CNA_CBUF_CON0_WEIGHT_BANK__SHIFT, rk.CNA_CBUF_CON0_WEIGHT_BANK__MASK) |
+      reg(1, rk.CNA_CBUF_CON0_DATA_BANK__SHIFT, rk.CNA_CBUF_CON0_DATA_BANK__MASK))
+    emit(rk.CNA, rk.REG_CNA_CBUF_CON1,
+      reg(cbuf_entries, rk.CNA_CBUF_CON1_DATA_ENTRIES__SHIFT, rk.CNA_CBUF_CON1_DATA_ENTRIES__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON0,
+      reg(1, rk.CNA_CVT_CON0_CVT_BYPASS__SHIFT, rk.CNA_CVT_CON0_CVT_BYPASS__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON1,
+      reg(1, rk.CNA_CVT_CON1_CVT_SCALE0__SHIFT, rk.CNA_CVT_CON1_CVT_SCALE0__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON2,
+      reg(1, rk.CNA_CVT_CON2_CVT_SCALE1__SHIFT, rk.CNA_CVT_CON2_CVT_SCALE1__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON3,
+      reg(1, rk.CNA_CVT_CON3_CVT_SCALE2__SHIFT, rk.CNA_CVT_CON3_CVT_SCALE2__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON4,
+      reg(1, rk.CNA_CVT_CON4_CVT_SCALE3__SHIFT, rk.CNA_CVT_CON4_CVT_SCALE3__MASK))
+    emit(rk.CNA, rk.REG_CNA_FC_CON0, 0)
+    emit(rk.CNA, rk.REG_CNA_FC_CON1, 0)
+    emit(rk.CNA, rk.REG_CNA_PAD_CON0, 0)
+    emit(rk.CNA, rk.REG_CNA_FEATURE_DATA_ADDR, input_dma)
+    emit(rk.CNA, rk.REG_CNA_FC_CON2, 0)
+    emit(rk.CNA, rk.REG_CNA_DMA_CON0,
+      reg(15, rk.CNA_DMA_CON0_WEIGHT_BURST_LEN__SHIFT, rk.CNA_DMA_CON0_WEIGHT_BURST_LEN__MASK) |
+      reg(15, rk.CNA_DMA_CON0_DATA_BURST_LEN__SHIFT, rk.CNA_DMA_CON0_DATA_BURST_LEN__MASK))
+    emit(rk.CNA, rk.REG_CNA_DMA_CON1,
+      reg(width_stride, rk.CNA_DMA_CON1_LINE_STRIDE__SHIFT, rk.CNA_DMA_CON1_LINE_STRIDE__MASK))
+    emit(rk.CNA, rk.REG_CNA_DMA_CON2,
+      reg(32, rk.CNA_DMA_CON2_SURF_STRIDE__SHIFT, rk.CNA_DMA_CON2_SURF_STRIDE__MASK))
+    emit(rk.CNA, rk.REG_CNA_FC_DATA_SIZE0,
+      reg(in_w, rk.CNA_FC_DATA_SIZE0_DMA_WIDTH__SHIFT, rk.CNA_FC_DATA_SIZE0_DMA_WIDTH__MASK) |
+      reg(in_h, rk.CNA_FC_DATA_SIZE0_DMA_HEIGHT__SHIFT, rk.CNA_FC_DATA_SIZE0_DMA_HEIGHT__MASK))
+    emit(rk.CNA, rk.REG_CNA_FC_DATA_SIZE1,
+      reg(align_c, rk.CNA_FC_DATA_SIZE1_DMA_CHANNEL__SHIFT, rk.CNA_FC_DATA_SIZE1_DMA_CHANNEL__MASK))
+    emit(rk.CNA, rk.REG_CNA_DCOMP_CTRL, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_REGNUM, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_ADDR0, weight_dma)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT0, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT1, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT2, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT3, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT4, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT5, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT6, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT7, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT8, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT9, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT10, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT11, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT12, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT13, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT14, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT15, 0)
+    emit(rk.CNA, rk.REG_CNA_CVT_CON5, 0x00000fff)
+    emit(rk.CNA, rk.REG_CNA_PAD_CON1, 0)
+    emit(rk.CORE, rk.REG_CORE_MISC_CFG,
+      reg(2, rk.CORE_MISC_CFG_PROC_PRECISION__SHIFT, rk.CORE_MISC_CFG_PROC_PRECISION__MASK))
+    emit(rk.CORE, rk.REG_CORE_DATAOUT_SIZE_0,
+      reg(out_h - 1, rk.CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT__SHIFT, rk.CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT__MASK) |
+      reg(out_w - 1, rk.CORE_DATAOUT_SIZE_0_DATAOUT_WIDTH__SHIFT, rk.CORE_DATAOUT_SIZE_0_DATAOUT_WIDTH__MASK))
+    emit(rk.CORE, rk.REG_CORE_DATAOUT_SIZE_1,
+      reg(align_out_c - 1, rk.CORE_DATAOUT_SIZE_1_DATAOUT_CHANNEL__SHIFT, rk.CORE_DATAOUT_SIZE_1_DATAOUT_CHANNEL__MASK))
+    emit(rk.CORE, rk.REG_CORE_CLIP_TRUNCATE, 0)
+    self.emit_raw(rk.CORE, 0x3030, 0)
+    emit(rk.DPU, rk.REG_DPU_FEATURE_MODE_CFG,
+      reg(15, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__SHIFT, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__MASK) |
+      reg(2, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_FORMAT,
+      reg(2, rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
+      reg(2, rk.DPU_DATA_FORMAT_IN_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_IN_PRECISION__MASK) |
+      reg(2, rk.DPU_DATA_FORMAT_PROC_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_PROC_PRECISION__MASK))
+    emit(rk.DPU, rk.REG_DPU_OFFSET_PEND, 0)
+    emit(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
+      reg(output_dma, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
+    emit(rk.DPU, rk.REG_DPU_DST_SURF_STRIDE,
+      reg(out_width_stride, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__SHIFT, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH,
+      reg(out_w - 1, rk.DPU_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_DATA_CUBE_WIDTH_WIDTH__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_HEIGHT,
+      reg(out_h - 1, rk.DPU_DATA_CUBE_HEIGHT_HEIGHT__SHIFT, rk.DPU_DATA_CUBE_HEIGHT_HEIGHT__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0)
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL,
+      reg(5, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__MASK) |
+      reg(align_out_c - 1, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__MASK))
+    emit(rk.DPU, rk.REG_DPU_BS_CFG,
+      reg(1, rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_RELU_BYPASS__MASK) |
+      reg(1, rk.DPU_BS_CFG_BS_MUL_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_MUL_BYPASS__MASK) |
+      reg(1, rk.DPU_BS_CFG_BS_ALU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_ALU_BYPASS__MASK) |
+      reg(1, rk.DPU_BS_CFG_BS_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_BS_ALU_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BS_MUL_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BS_RELUX_CMP_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_BS_OW_CFG,
+      reg(1, rk.DPU_BS_OW_CFG_SIZE_E_2__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_2__MASK) |
+      reg(1, rk.DPU_BS_OW_CFG_SIZE_E_1__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_1__MASK) |
+      reg(1, rk.DPU_BS_OW_CFG_SIZE_E_0__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_0__MASK) |
+      reg(1, rk.DPU_BS_OW_CFG_OD_BYPASS__SHIFT, rk.DPU_BS_OW_CFG_OD_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_BS_OW_OP, 0)
+    emit(rk.DPU, rk.REG_DPU_WDMA_SIZE_0,
+      reg(align_out_c - 1, rk.DPU_WDMA_SIZE_0_CHANNEL_WDMA__SHIFT, rk.DPU_WDMA_SIZE_0_CHANNEL_WDMA__MASK))
+    emit(rk.DPU, rk.REG_DPU_WDMA_SIZE_1,
+      reg(out_h - 1, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__MASK) |
+      reg(out_w - 1, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__MASK))
+    emit(rk.DPU, rk.REG_DPU_BN_CFG,
+      reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK) |
+      reg(1, rk.DPU_BN_CFG_BN_MUL_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_MUL_BYPASS__MASK) |
+      reg(1, rk.DPU_BN_CFG_BN_ALU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_ALU_BYPASS__MASK) |
+      reg(1, rk.DPU_BN_CFG_BN_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_BN_ALU_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BN_MUL_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_CFG,
+      reg(1, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_EW_CVT_OFFSET_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE,
+      reg(1, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE__SHIFT, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE__MASK))
+    emit(rk.DPU, rk.REG_DPU_EW_RELUX_CMP_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_OUT_CVT_OFFSET, 0)
+    emit(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
+      reg(1, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__SHIFT, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__MASK) |
+      reg(1, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK))
+    emit(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_0, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_1, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_2, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_3, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_4, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_5, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_6, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_7, 0)
+    emit(rk.DPU, rk.REG_DPU_SURFACE_ADD,
+      reg(surface_add, rk.DPU_SURFACE_ADD_SURF_ADD__SHIFT, rk.DPU_SURFACE_ADD_SURF_ADD__MASK))
+    self.emit_raw(0x0, 0x40c4, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_ACCESS_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_ACCESS_DATA, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_INFO, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_START, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_END, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_START, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_END, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_SLOPE_SCALE, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_SLOPE_SHIFT, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_SLOPE_SHIFT, 0)
+    emit(rk.PC, rk.REG_PC_REGISTER_AMOUNTS, 0)
+    emit(rk.PC, rk.REG_PC_VERSION, 0)
+    self.emit_raw(0x80, rk.REG_PC_OPERATION_ENABLE,
+      reg(6, rk.PC_OPERATION_ENABLE_RESERVED_0__SHIFT, rk.PC_OPERATION_ENABLE_RESERVED_0__MASK) |
+      reg(1, rk.PC_OPERATION_ENABLE_OP_EN__SHIFT, rk.PC_OPERATION_ENABLE_OP_EN__MASK))
+    if reset_queue:
+      self._rk_conv_debug = {
+        "dma": (input_dma, weight_dma, output_dma),
+        "dst_stride": out_width_stride,
+        "surface_add": surface_add,
+        "batch_count": 1,
+        "row_bytes": out_width_stride * align_out_c * np.dtype(np.float16).itemsize,
+        "out_channel_align": align_out_c,
+        "data_cube_width": out_w - 1,
+        "output_height_minus1": out_h - 1,
+        "dataout_atomics": dataout_atomics,
+      }
+
+  def _program_conv2d_6331(self, input_dma:int, weight_dma:int, output_dma:int, reset_queue: bool=True) -> None:
+    feature_grains = 8
+    in_h, in_w = 5, 7
+    out_h, out_w = 3, 7
+    align_c, align_out_c = 8, 16
+    width_stride = 8
+    out_width_stride = 24
+    dataout_atomics = out_h * out_w
+    weight_bytes_per_kernel = 48
+    weight_bytes_total = weight_bytes_per_kernel * 6
+    surface_add = out_width_stride * 2
+    cbuf_entries = 40
+    reg = self.reg
+    emit = self.emit_raw
+    self.q = []
+
+    emit(rk.CNA, rk.REG_CNA_CBUF_CON0,
+      reg(11, rk.CNA_CBUF_CON0_WEIGHT_BANK__SHIFT, rk.CNA_CBUF_CON0_WEIGHT_BANK__MASK) |
+      reg(1, rk.CNA_CBUF_CON0_DATA_BANK__SHIFT, rk.CNA_CBUF_CON0_DATA_BANK__MASK))
+    emit(rk.CNA, rk.REG_CNA_DCOMP_REGNUM, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_CTRL, 0)
+    emit(rk.CNA, rk.REG_CNA_CONV_CON1,
+      reg(1, rk.CNA_CONV_CON1_NONALIGN_DMA__SHIFT, rk.CNA_CONV_CON1_NONALIGN_DMA__MASK) |
+      reg(1, rk.CNA_CONV_CON1_GROUP_LINE_OFF__SHIFT, rk.CNA_CONV_CON1_GROUP_LINE_OFF__MASK) |
+      reg(10, rk.CNA_CONV_CON1_ARGB_IN__SHIFT, rk.CNA_CONV_CON1_ARGB_IN__MASK) |
+      reg(2, rk.CNA_CONV_CON1_PROC_PRECISION__SHIFT, rk.CNA_CONV_CON1_PROC_PRECISION__MASK) |
+      reg(2, rk.CNA_CONV_CON1_IN_PRECISION__SHIFT, rk.CNA_CONV_CON1_IN_PRECISION__MASK))
+    emit(rk.DPU, rk.REG_DPU_S_POINTER,
+      reg(1, rk.DPU_S_POINTER_POINTER_PP_MODE__SHIFT, rk.DPU_S_POINTER_POINTER_PP_MODE__MASK) |
+      reg(1, rk.DPU_S_POINTER_EXECUTER_PP_EN__SHIFT, rk.DPU_S_POINTER_EXECUTER_PP_EN__MASK) |
+      reg(1, rk.DPU_S_POINTER_POINTER_PP_EN__SHIFT, rk.DPU_S_POINTER_POINTER_PP_EN__MASK))
+    emit(rk.CNA, rk.REG_CNA_CONV_CON1,
+      reg(1, rk.CNA_CONV_CON1_NONALIGN_DMA__SHIFT, rk.CNA_CONV_CON1_NONALIGN_DMA__MASK) |
+      reg(1, rk.CNA_CONV_CON1_GROUP_LINE_OFF__SHIFT, rk.CNA_CONV_CON1_GROUP_LINE_OFF__MASK) |
+      reg(10, rk.CNA_CONV_CON1_ARGB_IN__SHIFT, rk.CNA_CONV_CON1_ARGB_IN__MASK) |
+      reg(2, rk.CNA_CONV_CON1_PROC_PRECISION__SHIFT, rk.CNA_CONV_CON1_PROC_PRECISION__MASK) |
+      reg(2, rk.CNA_CONV_CON1_IN_PRECISION__SHIFT, rk.CNA_CONV_CON1_IN_PRECISION__MASK))
+    emit(rk.CNA, rk.REG_CNA_CONV_CON2,
+      reg(feature_grains, rk.CNA_CONV_CON2_FEATURE_GRAINS__SHIFT, rk.CNA_CONV_CON2_FEATURE_GRAINS__MASK))
+    emit(rk.CNA, rk.REG_CNA_CONV_CON3,
+      reg(1, rk.CNA_CONV_CON3_CONV_Y_STRIDE__SHIFT, rk.CNA_CONV_CON3_CONV_Y_STRIDE__MASK) |
+      reg(1, rk.CNA_CONV_CON3_CONV_X_STRIDE__SHIFT, rk.CNA_CONV_CON3_CONV_X_STRIDE__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE0,
+      reg(width_stride, rk.CNA_DATA_SIZE0_DATAIN_WIDTH__SHIFT, rk.CNA_DATA_SIZE0_DATAIN_WIDTH__MASK) |
+      reg(in_h, rk.CNA_DATA_SIZE0_DATAIN_HEIGHT__SHIFT, rk.CNA_DATA_SIZE0_DATAIN_HEIGHT__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE1,
+      reg(2, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL__SHIFT, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL__MASK) |
+      reg(align_c, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL__SHIFT, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE2,
+      reg(out_w, rk.CNA_DATA_SIZE2_DATAOUT_WIDTH__SHIFT, rk.CNA_DATA_SIZE2_DATAOUT_WIDTH__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE3,
+      reg(dataout_atomics, rk.CNA_DATA_SIZE3_DATAOUT_ATOMICS__SHIFT, rk.CNA_DATA_SIZE3_DATAOUT_ATOMICS__MASK))
+    emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE0, weight_bytes_total)
+    emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE1,
+      reg(weight_bytes_per_kernel, rk.CNA_WEIGHT_SIZE1_WEIGHT_BYTES_PER_KERNEL__SHIFT, rk.CNA_WEIGHT_SIZE1_WEIGHT_BYTES_PER_KERNEL__MASK))
+    emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE2,
+      reg(1, rk.CNA_WEIGHT_SIZE2_WEIGHT_WIDTH__SHIFT, rk.CNA_WEIGHT_SIZE2_WEIGHT_WIDTH__MASK) |
+      reg(3, rk.CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT__SHIFT, rk.CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT__MASK) |
+      reg(6, rk.CNA_WEIGHT_SIZE2_WEIGHT_KERNELS__SHIFT, rk.CNA_WEIGHT_SIZE2_WEIGHT_KERNELS__MASK))
+    emit(rk.CNA, rk.REG_CNA_CBUF_CON0,
+      reg(11, rk.CNA_CBUF_CON0_WEIGHT_BANK__SHIFT, rk.CNA_CBUF_CON0_WEIGHT_BANK__MASK) |
+      reg(1, rk.CNA_CBUF_CON0_DATA_BANK__SHIFT, rk.CNA_CBUF_CON0_DATA_BANK__MASK))
+    emit(rk.CNA, rk.REG_CNA_CBUF_CON1,
+      reg(cbuf_entries, rk.CNA_CBUF_CON1_DATA_ENTRIES__SHIFT, rk.CNA_CBUF_CON1_DATA_ENTRIES__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON0,
+      reg(1, rk.CNA_CVT_CON0_CVT_BYPASS__SHIFT, rk.CNA_CVT_CON0_CVT_BYPASS__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON1,
+      reg(1, rk.CNA_CVT_CON1_CVT_SCALE0__SHIFT, rk.CNA_CVT_CON1_CVT_SCALE0__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON2,
+      reg(1, rk.CNA_CVT_CON2_CVT_SCALE1__SHIFT, rk.CNA_CVT_CON2_CVT_SCALE1__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON3,
+      reg(1, rk.CNA_CVT_CON3_CVT_SCALE2__SHIFT, rk.CNA_CVT_CON3_CVT_SCALE2__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON4,
+      reg(1, rk.CNA_CVT_CON4_CVT_SCALE3__SHIFT, rk.CNA_CVT_CON4_CVT_SCALE3__MASK))
+    emit(rk.CNA, rk.REG_CNA_FC_CON0, 0)
+    emit(rk.CNA, rk.REG_CNA_FC_CON1, 0)
+    emit(rk.CNA, rk.REG_CNA_PAD_CON0, 0)
+    emit(rk.CNA, rk.REG_CNA_FEATURE_DATA_ADDR, input_dma)
+    emit(rk.CNA, rk.REG_CNA_FC_CON2, 0)
+    emit(rk.CNA, rk.REG_CNA_DMA_CON0,
+      reg(15, rk.CNA_DMA_CON0_WEIGHT_BURST_LEN__SHIFT, rk.CNA_DMA_CON0_WEIGHT_BURST_LEN__MASK) |
+      reg(15, rk.CNA_DMA_CON0_DATA_BURST_LEN__SHIFT, rk.CNA_DMA_CON0_DATA_BURST_LEN__MASK))
+    emit(rk.CNA, rk.REG_CNA_DMA_CON1,
+      reg(width_stride, rk.CNA_DMA_CON1_LINE_STRIDE__SHIFT, rk.CNA_DMA_CON1_LINE_STRIDE__MASK))
+    emit(rk.CNA, rk.REG_CNA_DMA_CON2,
+      reg(32, rk.CNA_DMA_CON2_SURF_STRIDE__SHIFT, rk.CNA_DMA_CON2_SURF_STRIDE__MASK))
+    emit(rk.CNA, rk.REG_CNA_FC_DATA_SIZE0,
+      reg(in_w, rk.CNA_FC_DATA_SIZE0_DMA_WIDTH__SHIFT, rk.CNA_FC_DATA_SIZE0_DMA_WIDTH__MASK) |
+      reg(in_h, rk.CNA_FC_DATA_SIZE0_DMA_HEIGHT__SHIFT, rk.CNA_FC_DATA_SIZE0_DMA_HEIGHT__MASK))
+    emit(rk.CNA, rk.REG_CNA_FC_DATA_SIZE1,
+      reg(align_c, rk.CNA_FC_DATA_SIZE1_DMA_CHANNEL__SHIFT, rk.CNA_FC_DATA_SIZE1_DMA_CHANNEL__MASK))
+    emit(rk.CNA, rk.REG_CNA_DCOMP_CTRL, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_REGNUM, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_ADDR0, weight_dma)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT0, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT1, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT2, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT3, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT4, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT5, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT6, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT7, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT8, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT9, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT10, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT11, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT12, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT13, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT14, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT15, 0)
+    emit(rk.CNA, rk.REG_CNA_CVT_CON5, 0x00000fff)
+    emit(rk.CNA, rk.REG_CNA_PAD_CON1, 0)
+    emit(rk.CORE, rk.REG_CORE_MISC_CFG,
+      reg(2, rk.CORE_MISC_CFG_PROC_PRECISION__SHIFT, rk.CORE_MISC_CFG_PROC_PRECISION__MASK))
+    emit(rk.CORE, rk.REG_CORE_DATAOUT_SIZE_0,
+      reg(out_h - 1, rk.CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT__SHIFT, rk.CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT__MASK) |
+      reg(out_w - 1, rk.CORE_DATAOUT_SIZE_0_DATAOUT_WIDTH__SHIFT, rk.CORE_DATAOUT_SIZE_0_DATAOUT_WIDTH__MASK))
+    emit(rk.CORE, rk.REG_CORE_DATAOUT_SIZE_1,
+      reg(align_out_c - 1, rk.CORE_DATAOUT_SIZE_1_DATAOUT_CHANNEL__SHIFT, rk.CORE_DATAOUT_SIZE_1_DATAOUT_CHANNEL__MASK))
+    emit(rk.CORE, rk.REG_CORE_CLIP_TRUNCATE, 0)
+    self.emit_raw(rk.CORE, 0x3030, 0)
+    emit(rk.DPU, rk.REG_DPU_FEATURE_MODE_CFG,
+      reg(15, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__SHIFT, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__MASK) |
+      reg(2, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_FORMAT,
+      reg(2, rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
+      reg(2, rk.DPU_DATA_FORMAT_IN_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_IN_PRECISION__MASK) |
+      reg(2, rk.DPU_DATA_FORMAT_PROC_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_PROC_PRECISION__MASK))
+    emit(rk.DPU, rk.REG_DPU_OFFSET_PEND, 0)
+    emit(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
+      reg(output_dma, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
+    emit(rk.DPU, rk.REG_DPU_DST_SURF_STRIDE,
+      reg(out_width_stride, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__SHIFT, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH,
+      reg(out_w - 1, rk.DPU_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_DATA_CUBE_WIDTH_WIDTH__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_HEIGHT,
+      reg(out_h - 1, rk.DPU_DATA_CUBE_HEIGHT_HEIGHT__SHIFT, rk.DPU_DATA_CUBE_HEIGHT_HEIGHT__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0)
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL,
+      reg(5, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__MASK) |
+      reg(align_out_c - 1, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__MASK))
+    emit(rk.DPU, rk.REG_DPU_BS_CFG,
+      reg(1, rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_RELU_BYPASS__MASK) |
+      reg(1, rk.DPU_BS_CFG_BS_MUL_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_MUL_BYPASS__MASK) |
+      reg(1, rk.DPU_BS_CFG_BS_ALU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_ALU_BYPASS__MASK) |
+      reg(1, rk.DPU_BS_CFG_BS_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_BS_ALU_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BS_MUL_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BS_RELUX_CMP_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_BS_OW_CFG,
+      reg(1, rk.DPU_BS_OW_CFG_SIZE_E_2__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_2__MASK) |
+      reg(1, rk.DPU_BS_OW_CFG_SIZE_E_1__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_1__MASK) |
+      reg(1, rk.DPU_BS_OW_CFG_SIZE_E_0__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_0__MASK) |
+      reg(1, rk.DPU_BS_OW_CFG_OD_BYPASS__SHIFT, rk.DPU_BS_OW_CFG_OD_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_BS_OW_OP, 0)
+    emit(rk.DPU, rk.REG_DPU_WDMA_SIZE_0,
+      reg(align_out_c - 1, rk.DPU_WDMA_SIZE_0_CHANNEL_WDMA__SHIFT, rk.DPU_WDMA_SIZE_0_CHANNEL_WDMA__MASK))
+    emit(rk.DPU, rk.REG_DPU_WDMA_SIZE_1,
+      reg(out_h - 1, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__MASK) |
+      reg(out_w - 1, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__MASK))
+    emit(rk.DPU, rk.REG_DPU_BN_CFG,
+      reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK) |
+      reg(1, rk.DPU_BN_CFG_BN_MUL_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_MUL_BYPASS__MASK) |
+      reg(1, rk.DPU_BN_CFG_BN_ALU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_ALU_BYPASS__MASK) |
+      reg(1, rk.DPU_BN_CFG_BN_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_BN_ALU_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BN_MUL_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_CFG,
+      reg(1, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_EW_CVT_OFFSET_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE,
+      reg(1, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE__SHIFT, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE__MASK))
+    emit(rk.DPU, rk.REG_DPU_EW_RELUX_CMP_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_OUT_CVT_OFFSET, 0)
+    emit(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
+      reg(1, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__SHIFT, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__MASK) |
+      reg(1, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK))
+    emit(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_0, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_1, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_2, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_3, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_4, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_5, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_6, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_7, 0)
+    emit(rk.DPU, rk.REG_DPU_SURFACE_ADD,
+      reg(surface_add, rk.DPU_SURFACE_ADD_SURF_ADD__SHIFT, rk.DPU_SURFACE_ADD_SURF_ADD__MASK))
+    self.emit_raw(0x0, 0x40c4, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_ACCESS_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_ACCESS_DATA, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_INFO, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_START, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_END, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_START, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_END, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_SLOPE_SCALE, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_SLOPE_SHIFT, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_SLOPE_SHIFT, 0)
+    emit(rk.PC, rk.REG_PC_REGISTER_AMOUNTS, 0)
+    emit(rk.PC, rk.REG_PC_VERSION, 0)
+    self.emit_raw(0x80, rk.REG_PC_OPERATION_ENABLE,
+      reg(6, rk.PC_OPERATION_ENABLE_RESERVED_0__SHIFT, rk.PC_OPERATION_ENABLE_RESERVED_0__MASK) |
+      reg(1, rk.PC_OPERATION_ENABLE_OP_EN__SHIFT, rk.PC_OPERATION_ENABLE_OP_EN__MASK))
+    if reset_queue:
+      self._rk_conv_debug = {
+        "dma": (input_dma, weight_dma, output_dma),
+        "dst_stride": out_width_stride,
+        "surface_add": surface_add,
+        "batch_count": 1,
+        "row_bytes": out_width_stride * align_out_c * np.dtype(np.float16).itemsize,
+        "out_channel_align": align_out_c,
+        "data_cube_width": out_w - 1,
+        "output_height_minus1": out_h - 1,
+        "dataout_atomics": dataout_atomics,
+      }
+
+  def _program_conv2d_6333(self, input_dma:int, weight_dma:int, output_dma:int, reset_queue: bool=True) -> None:
+    feature_grains = 8
+    in_h, in_w = 5, 7
+    out_h, out_w = 3, 5
+    align_c, align_out_c = 8, 16
+    width_stride = 8
+    out_width_stride = 16
+    dataout_atomics = out_h * out_w
+    weight_bytes_per_kernel = 144
+    weight_bytes_total = weight_bytes_per_kernel * 6
+    surface_add = out_width_stride * 2
+    cbuf_entries = 40
+    reg = self.reg
+    emit = self.emit_raw
+    self.q = []
+
+    emit(rk.CNA, rk.REG_CNA_CBUF_CON0,
+      reg(11, rk.CNA_CBUF_CON0_WEIGHT_BANK__SHIFT, rk.CNA_CBUF_CON0_WEIGHT_BANK__MASK) |
+      reg(1, rk.CNA_CBUF_CON0_DATA_BANK__SHIFT, rk.CNA_CBUF_CON0_DATA_BANK__MASK))
+    emit(rk.CNA, rk.REG_CNA_DCOMP_REGNUM, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_CTRL, 0)
+    emit(rk.CNA, rk.REG_CNA_CONV_CON1,
+      reg(1, rk.CNA_CONV_CON1_NONALIGN_DMA__SHIFT, rk.CNA_CONV_CON1_NONALIGN_DMA__MASK) |
+      reg(1, rk.CNA_CONV_CON1_GROUP_LINE_OFF__SHIFT, rk.CNA_CONV_CON1_GROUP_LINE_OFF__MASK) |
+      reg(10, rk.CNA_CONV_CON1_ARGB_IN__SHIFT, rk.CNA_CONV_CON1_ARGB_IN__MASK) |
+      reg(2, rk.CNA_CONV_CON1_PROC_PRECISION__SHIFT, rk.CNA_CONV_CON1_PROC_PRECISION__MASK) |
+      reg(2, rk.CNA_CONV_CON1_IN_PRECISION__SHIFT, rk.CNA_CONV_CON1_IN_PRECISION__MASK))
+    emit(rk.DPU, rk.REG_DPU_S_POINTER,
+      reg(1, rk.DPU_S_POINTER_POINTER_PP_MODE__SHIFT, rk.DPU_S_POINTER_POINTER_PP_MODE__MASK) |
+      reg(1, rk.DPU_S_POINTER_EXECUTER_PP_EN__SHIFT, rk.DPU_S_POINTER_EXECUTER_PP_EN__MASK) |
+      reg(1, rk.DPU_S_POINTER_POINTER_PP_EN__SHIFT, rk.DPU_S_POINTER_POINTER_PP_EN__MASK))
+    emit(rk.CNA, rk.REG_CNA_CONV_CON1,
+      reg(1, rk.CNA_CONV_CON1_NONALIGN_DMA__SHIFT, rk.CNA_CONV_CON1_NONALIGN_DMA__MASK) |
+      reg(1, rk.CNA_CONV_CON1_GROUP_LINE_OFF__SHIFT, rk.CNA_CONV_CON1_GROUP_LINE_OFF__MASK) |
+      reg(10, rk.CNA_CONV_CON1_ARGB_IN__SHIFT, rk.CNA_CONV_CON1_ARGB_IN__MASK) |
+      reg(2, rk.CNA_CONV_CON1_PROC_PRECISION__SHIFT, rk.CNA_CONV_CON1_PROC_PRECISION__MASK) |
+      reg(2, rk.CNA_CONV_CON1_IN_PRECISION__SHIFT, rk.CNA_CONV_CON1_IN_PRECISION__MASK))
+    emit(rk.CNA, rk.REG_CNA_CONV_CON2,
+      reg(feature_grains, rk.CNA_CONV_CON2_FEATURE_GRAINS__SHIFT, rk.CNA_CONV_CON2_FEATURE_GRAINS__MASK))
+    emit(rk.CNA, rk.REG_CNA_CONV_CON3,
+      reg(1, rk.CNA_CONV_CON3_CONV_Y_STRIDE__SHIFT, rk.CNA_CONV_CON3_CONV_Y_STRIDE__MASK) |
+      reg(1, rk.CNA_CONV_CON3_CONV_X_STRIDE__SHIFT, rk.CNA_CONV_CON3_CONV_X_STRIDE__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE0,
+      reg(width_stride, rk.CNA_DATA_SIZE0_DATAIN_WIDTH__SHIFT, rk.CNA_DATA_SIZE0_DATAIN_WIDTH__MASK) |
+      reg(in_h, rk.CNA_DATA_SIZE0_DATAIN_HEIGHT__SHIFT, rk.CNA_DATA_SIZE0_DATAIN_HEIGHT__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE1,
+      reg(2, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL__SHIFT, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL_REAL__MASK) |
+      reg(align_c, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL__SHIFT, rk.CNA_DATA_SIZE1_DATAIN_CHANNEL__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE2,
+      reg(out_w, rk.CNA_DATA_SIZE2_DATAOUT_WIDTH__SHIFT, rk.CNA_DATA_SIZE2_DATAOUT_WIDTH__MASK))
+    emit(rk.CNA, rk.REG_CNA_DATA_SIZE3,
+      reg(dataout_atomics, rk.CNA_DATA_SIZE3_DATAOUT_ATOMICS__SHIFT, rk.CNA_DATA_SIZE3_DATAOUT_ATOMICS__MASK))
+    emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE0, weight_bytes_total)
+    emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE1,
+      reg(weight_bytes_per_kernel, rk.CNA_WEIGHT_SIZE1_WEIGHT_BYTES_PER_KERNEL__SHIFT, rk.CNA_WEIGHT_SIZE1_WEIGHT_BYTES_PER_KERNEL__MASK))
+    emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE2,
+      reg(3, rk.CNA_WEIGHT_SIZE2_WEIGHT_WIDTH__SHIFT, rk.CNA_WEIGHT_SIZE2_WEIGHT_WIDTH__MASK) |
+      reg(3, rk.CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT__SHIFT, rk.CNA_WEIGHT_SIZE2_WEIGHT_HEIGHT__MASK) |
+      reg(6, rk.CNA_WEIGHT_SIZE2_WEIGHT_KERNELS__SHIFT, rk.CNA_WEIGHT_SIZE2_WEIGHT_KERNELS__MASK))
+    emit(rk.CNA, rk.REG_CNA_CBUF_CON0,
+      reg(11, rk.CNA_CBUF_CON0_WEIGHT_BANK__SHIFT, rk.CNA_CBUF_CON0_WEIGHT_BANK__MASK) |
+      reg(1, rk.CNA_CBUF_CON0_DATA_BANK__SHIFT, rk.CNA_CBUF_CON0_DATA_BANK__MASK))
+    emit(rk.CNA, rk.REG_CNA_CBUF_CON1,
+      reg(cbuf_entries, rk.CNA_CBUF_CON1_DATA_ENTRIES__SHIFT, rk.CNA_CBUF_CON1_DATA_ENTRIES__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON0,
+      reg(1, rk.CNA_CVT_CON0_CVT_BYPASS__SHIFT, rk.CNA_CVT_CON0_CVT_BYPASS__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON1,
+      reg(1, rk.CNA_CVT_CON1_CVT_SCALE0__SHIFT, rk.CNA_CVT_CON1_CVT_SCALE0__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON2,
+      reg(1, rk.CNA_CVT_CON2_CVT_SCALE1__SHIFT, rk.CNA_CVT_CON2_CVT_SCALE1__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON3,
+      reg(1, rk.CNA_CVT_CON3_CVT_SCALE2__SHIFT, rk.CNA_CVT_CON3_CVT_SCALE2__MASK))
+    emit(rk.CNA, rk.REG_CNA_CVT_CON4,
+      reg(1, rk.CNA_CVT_CON4_CVT_SCALE3__SHIFT, rk.CNA_CVT_CON4_CVT_SCALE3__MASK))
+    emit(rk.CNA, rk.REG_CNA_FC_CON0, 0)
+    emit(rk.CNA, rk.REG_CNA_FC_CON1, 0)
+    emit(rk.CNA, rk.REG_CNA_PAD_CON0, 0)
+    emit(rk.CNA, rk.REG_CNA_FEATURE_DATA_ADDR, input_dma)
+    emit(rk.CNA, rk.REG_CNA_FC_CON2, 0)
+    emit(rk.CNA, rk.REG_CNA_DMA_CON0,
+      reg(15, rk.CNA_DMA_CON0_WEIGHT_BURST_LEN__SHIFT, rk.CNA_DMA_CON0_WEIGHT_BURST_LEN__MASK) |
+      reg(15, rk.CNA_DMA_CON0_DATA_BURST_LEN__SHIFT, rk.CNA_DMA_CON0_DATA_BURST_LEN__MASK))
+    emit(rk.CNA, rk.REG_CNA_DMA_CON1,
+      reg(width_stride, rk.CNA_DMA_CON1_LINE_STRIDE__SHIFT, rk.CNA_DMA_CON1_LINE_STRIDE__MASK))
+    emit(rk.CNA, rk.REG_CNA_DMA_CON2,
+      reg(32, rk.CNA_DMA_CON2_SURF_STRIDE__SHIFT, rk.CNA_DMA_CON2_SURF_STRIDE__MASK))
+    emit(rk.CNA, rk.REG_CNA_FC_DATA_SIZE0,
+      reg(in_w, rk.CNA_FC_DATA_SIZE0_DMA_WIDTH__SHIFT, rk.CNA_FC_DATA_SIZE0_DMA_WIDTH__MASK) |
+      reg(in_h, rk.CNA_FC_DATA_SIZE0_DMA_HEIGHT__SHIFT, rk.CNA_FC_DATA_SIZE0_DMA_HEIGHT__MASK))
+    emit(rk.CNA, rk.REG_CNA_FC_DATA_SIZE1,
+      reg(align_c, rk.CNA_FC_DATA_SIZE1_DMA_CHANNEL__SHIFT, rk.CNA_FC_DATA_SIZE1_DMA_CHANNEL__MASK))
+    emit(rk.CNA, rk.REG_CNA_DCOMP_CTRL, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_REGNUM, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_ADDR0, weight_dma)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT0, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT1, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT2, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT3, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT4, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT5, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT6, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT7, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT8, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT9, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT10, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT11, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT12, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT13, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT14, 0)
+    emit(rk.CNA, rk.REG_CNA_DCOMP_AMOUNT15, 0)
+    emit(rk.CNA, rk.REG_CNA_CVT_CON5, 0x00000fff)
+    emit(rk.CNA, rk.REG_CNA_PAD_CON1, 0)
+    emit(rk.CORE, rk.REG_CORE_MISC_CFG,
+      reg(2, rk.CORE_MISC_CFG_PROC_PRECISION__SHIFT, rk.CORE_MISC_CFG_PROC_PRECISION__MASK))
+    emit(rk.CORE, rk.REG_CORE_DATAOUT_SIZE_0,
+      reg(out_h - 1, rk.CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT__SHIFT, rk.CORE_DATAOUT_SIZE_0_DATAOUT_HEIGHT__MASK) |
+      reg(out_w - 1, rk.CORE_DATAOUT_SIZE_0_DATAOUT_WIDTH__SHIFT, rk.CORE_DATAOUT_SIZE_0_DATAOUT_WIDTH__MASK))
+    emit(rk.CORE, rk.REG_CORE_DATAOUT_SIZE_1,
+      reg(align_out_c - 1, rk.CORE_DATAOUT_SIZE_1_DATAOUT_CHANNEL__SHIFT, rk.CORE_DATAOUT_SIZE_1_DATAOUT_CHANNEL__MASK))
+    emit(rk.CORE, rk.REG_CORE_CLIP_TRUNCATE, 0)
+    self.emit_raw(rk.CORE, 0x3030, 0)
+    emit(rk.DPU, rk.REG_DPU_FEATURE_MODE_CFG,
+      reg(15, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__SHIFT, rk.DPU_FEATURE_MODE_CFG_BURST_LEN__MASK) |
+      reg(2, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__SHIFT, rk.DPU_FEATURE_MODE_CFG_OUTPUT_MODE__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_FORMAT,
+      reg(2, rk.DPU_DATA_FORMAT_OUT_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_OUT_PRECISION__MASK) |
+      reg(2, rk.DPU_DATA_FORMAT_IN_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_IN_PRECISION__MASK) |
+      reg(2, rk.DPU_DATA_FORMAT_PROC_PRECISION__SHIFT, rk.DPU_DATA_FORMAT_PROC_PRECISION__MASK))
+    emit(rk.DPU, rk.REG_DPU_OFFSET_PEND, 0)
+    emit(rk.DPU, rk.REG_DPU_DST_BASE_ADDR,
+      reg(output_dma, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
+    emit(rk.DPU, rk.REG_DPU_DST_SURF_STRIDE,
+      reg(out_width_stride, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__SHIFT, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH,
+      reg(out_w - 1, rk.DPU_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_DATA_CUBE_WIDTH_WIDTH__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_HEIGHT,
+      reg(out_h - 1, rk.DPU_DATA_CUBE_HEIGHT_HEIGHT__SHIFT, rk.DPU_DATA_CUBE_HEIGHT_HEIGHT__MASK))
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR, 0)
+    emit(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL,
+      reg(5, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__MASK) |
+      reg(align_out_c - 1, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__MASK))
+    emit(rk.DPU, rk.REG_DPU_BS_CFG,
+      reg(1, rk.DPU_BS_CFG_BS_RELU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_RELU_BYPASS__MASK) |
+      reg(1, rk.DPU_BS_CFG_BS_MUL_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_MUL_BYPASS__MASK) |
+      reg(1, rk.DPU_BS_CFG_BS_ALU_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_ALU_BYPASS__MASK) |
+      reg(1, rk.DPU_BS_CFG_BS_BYPASS__SHIFT, rk.DPU_BS_CFG_BS_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_BS_ALU_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BS_MUL_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BS_RELUX_CMP_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_BS_OW_CFG,
+      reg(1, rk.DPU_BS_OW_CFG_SIZE_E_2__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_2__MASK) |
+      reg(1, rk.DPU_BS_OW_CFG_SIZE_E_1__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_1__MASK) |
+      reg(1, rk.DPU_BS_OW_CFG_SIZE_E_0__SHIFT, rk.DPU_BS_OW_CFG_SIZE_E_0__MASK) |
+      reg(1, rk.DPU_BS_OW_CFG_OD_BYPASS__SHIFT, rk.DPU_BS_OW_CFG_OD_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_BS_OW_OP, 0)
+    emit(rk.DPU, rk.REG_DPU_WDMA_SIZE_0,
+      reg(align_out_c - 1, rk.DPU_WDMA_SIZE_0_CHANNEL_WDMA__SHIFT, rk.DPU_WDMA_SIZE_0_CHANNEL_WDMA__MASK))
+    emit(rk.DPU, rk.REG_DPU_WDMA_SIZE_1,
+      reg(out_h - 1, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__MASK) |
+      reg(out_w - 1, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__MASK))
+    emit(rk.DPU, rk.REG_DPU_BN_CFG,
+      reg(1, rk.DPU_BN_CFG_BN_RELU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_RELU_BYPASS__MASK) |
+      reg(1, rk.DPU_BN_CFG_BN_MUL_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_MUL_BYPASS__MASK) |
+      reg(1, rk.DPU_BN_CFG_BN_ALU_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_ALU_BYPASS__MASK) |
+      reg(1, rk.DPU_BN_CFG_BN_BYPASS__SHIFT, rk.DPU_BN_CFG_BN_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_BN_ALU_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BN_MUL_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_BN_RELUX_CMP_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_CFG,
+      reg(1, rk.DPU_EW_CFG_EW_RELU_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_RELU_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_CVT_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_LUT_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_LUT_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_OP_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_OP_BYPASS__MASK) |
+      reg(1, rk.DPU_EW_CFG_EW_BYPASS__SHIFT, rk.DPU_EW_CFG_EW_BYPASS__MASK))
+    emit(rk.DPU, rk.REG_DPU_EW_CVT_OFFSET_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_CVT_SCALE_VALUE,
+      reg(1, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE__SHIFT, rk.DPU_EW_CVT_SCALE_VALUE_EW_OP_CVT_SCALE__MASK))
+    emit(rk.DPU, rk.REG_DPU_EW_RELUX_CMP_VALUE, 0)
+    emit(rk.DPU, rk.REG_DPU_OUT_CVT_OFFSET, 0)
+    emit(rk.DPU, rk.REG_DPU_OUT_CVT_SCALE,
+      reg(1, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__SHIFT, rk.DPU_OUT_CVT_SCALE_FP32TOFP16_EN__MASK) |
+      reg(1, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__SHIFT, rk.DPU_OUT_CVT_SCALE_OUT_CVT_SCALE__MASK))
+    emit(rk.DPU, rk.REG_DPU_OUT_CVT_SHIFT, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_0, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_1, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_2, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_3, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_4, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_5, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_6, 0)
+    emit(rk.DPU, rk.REG_DPU_EW_OP_VALUE_7, 0)
+    emit(rk.DPU, rk.REG_DPU_SURFACE_ADD,
+      reg(surface_add, rk.DPU_SURFACE_ADD_SURF_ADD__SHIFT, rk.DPU_SURFACE_ADD_SURF_ADD__MASK))
+    self.emit_raw(0x0, 0x40c4, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_ACCESS_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_ACCESS_DATA, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_CFG, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_INFO, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_START, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_END, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_START, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_END, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_SLOPE_SCALE, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LE_SLOPE_SHIFT, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_SLOPE_SCALE, 0)
+    emit(rk.DPU, rk.REG_DPU_LUT_LO_SLOPE_SHIFT, 0)
+    emit(rk.PC, rk.REG_PC_REGISTER_AMOUNTS, 0)
+    emit(rk.PC, rk.REG_PC_VERSION, 0)
+    self.emit_raw(0x80, rk.REG_PC_OPERATION_ENABLE,
+      reg(6, rk.PC_OPERATION_ENABLE_RESERVED_0__SHIFT, rk.PC_OPERATION_ENABLE_RESERVED_0__MASK) |
+      reg(1, rk.PC_OPERATION_ENABLE_OP_EN__SHIFT, rk.PC_OPERATION_ENABLE_OP_EN__MASK))
+    if reset_queue:
+      self._rk_conv_debug = {
+        "dma": (input_dma, weight_dma, output_dma),
+        "dst_stride": out_width_stride,
+        "surface_add": surface_add,
+        "batch_count": 1,
+        "row_bytes": out_width_stride * align_out_c * np.dtype(np.float16).itemsize,
+        "out_channel_align": align_out_c,
+        "data_cube_width": out_w - 1,
+        "output_height_minus1": out_h - 1,
+        "dataout_atomics": dataout_atomics,
+      }
+
+  def _conv2d_hw_6321(self, lhs_arr: np.ndarray, rhs_arr: np.ndarray, dtype: DType, np_dtype: np.dtype) -> np.ndarray|None:
+    supported_dtypes = {dtypes.float, dtypes.float32, dtypes.float16}
+    if dtype not in supported_dtypes or np_dtype not in (np.float16, np.float32):
+      return None
+    if lhs_arr.shape != (1, 3, 5, 7) or rhs_arr.shape != (6, 3, 2, 1):
+      return None
+
+    align_c, align_out_c = 8, 16
+    width_stride = 8
+    out_width_stride = 28
+    out_h, out_w = 4, 7
+
+    lhs_fp16 = np.ascontiguousarray(lhs_arr.astype(np.float16, copy=False))
+    rhs_fp16 = np.ascontiguousarray(rhs_arr.astype(np.float16, copy=False))
+    packed_input = self._pack_nc1hwc2_fp16(lhs_fp16, 1, 3, 5, 7, align_c, width_stride)
+    packed_weights = self._pack_conv_weights_fp16(rhs_fp16, 6, 3, 2, 1, align_c, align_c, groups=1)
+
+    input_bytes = packed_input.tobytes()
+    weight_bytes = packed_weights.tobytes()
+    input_hw = weight_hw = output_hw = None
+    try:
+      input_hw = self.device._gpu_alloc(len(input_bytes), 0, name="input")
+      weight_hw = self.device._gpu_alloc(len(weight_bytes), 0, name="weight")
+      output_elems = out_h * out_width_stride * align_out_c
+      output_hw = self.device._gpu_alloc(output_elems * np.dtype(np.float16).itemsize, 0, name="output")
+      ctypes.memmove(input_hw.va_addr, input_bytes, len(input_bytes))
+      ctypes.memmove(weight_hw.va_addr, weight_bytes, len(weight_bytes))
+      ctypes.memset(output_hw.va_addr, 0, output_hw.size)
+
+      self._program_conv2d_6321(input_hw.meta.dma_addr, weight_hw.meta.dma_addr, output_hw.meta.dma_addr)
+      self._submit_conv()
+
+      raw_output = ctypes.string_at(output_hw.va_addr, output_hw.size)
+      hw_view = np.frombuffer(raw_output, dtype=np.float16, count=output_elems)
+      nc1hwc2_elems = out_h * out_w * 8
+      unpacked = self._unpack_nc1hwc2_fp16(hw_view[:nc1hwc2_elems], 1, 6, out_h, out_w, 8, out_w)
+      return unpacked.astype(np_dtype, copy=False)
+    finally:
+      for buf in (input_hw, weight_hw, output_hw):
+        if buf is not None and hasattr(self.device, "_gpu_free"):
+          self.device._gpu_free(buf)
+
+  def _conv2d_hw_6325(self, lhs_arr: np.ndarray, rhs_arr: np.ndarray, dtype: DType, np_dtype: np.dtype) -> np.ndarray|None:
+    supported_dtypes = {dtypes.float, dtypes.float32, dtypes.float16}
+    if dtype not in supported_dtypes or np_dtype not in (np.float16, np.float32):
+      return None
+    if lhs_arr.shape != (1, 3, 5, 7) or rhs_arr.shape != (6, 3, 2, 5):
+      return None
+
+    align_c, align_out_c = 8, 16
+    width_stride = 8
+    out_width_stride = 12
+    out_h, out_w = 4, 3
+
+    lhs_fp16 = np.ascontiguousarray(lhs_arr.astype(np.float16, copy=False))
+    rhs_fp16 = np.ascontiguousarray(rhs_arr.astype(np.float16, copy=False))
+    packed_input = self._pack_nc1hwc2_fp16(lhs_fp16, 1, 3, 5, 7, align_c, width_stride)
+    packed_weights = self._pack_conv_weights_fp16(rhs_fp16, 6, 3, 2, 5, align_c, align_c, groups=1)
+
+    input_bytes = packed_input.tobytes()
+    weight_bytes = packed_weights.tobytes()
+    input_hw = weight_hw = output_hw = None
+    try:
+      input_hw = self.device._gpu_alloc(len(input_bytes), 0, name="input")
+      weight_hw = self.device._gpu_alloc(len(weight_bytes), 0, name="weight")
+      output_elems = out_h * out_width_stride * align_out_c
+      output_hw = self.device._gpu_alloc(output_elems * np.dtype(np.float16).itemsize, 0, name="output")
+      ctypes.memmove(input_hw.va_addr, input_bytes, len(input_bytes))
+      ctypes.memmove(weight_hw.va_addr, weight_bytes, len(weight_bytes))
+      ctypes.memset(output_hw.va_addr, 0, output_hw.size)
+
+      self._program_conv2d_6325(input_hw.meta.dma_addr, weight_hw.meta.dma_addr, output_hw.meta.dma_addr)
+      self._submit_conv()
+
+      raw_output = ctypes.string_at(output_hw.va_addr, output_hw.size)
+      hw_view = np.frombuffer(raw_output, dtype=np.float16, count=output_elems)
+      nc1hwc2_elems = out_h * out_w * 8
+      unpacked = self._unpack_nc1hwc2_fp16(hw_view[:nc1hwc2_elems], 1, 6, out_h, out_w, 8, out_w)
+      return unpacked.astype(np_dtype, copy=False)
+    finally:
+      for buf in (input_hw, weight_hw, output_hw):
+        if buf is not None and hasattr(self.device, "_gpu_free"):
+          self.device._gpu_free(buf)
+
+  def _conv2d_hw_6323(self, lhs_arr: np.ndarray, rhs_arr: np.ndarray, dtype: DType, np_dtype: np.dtype) -> np.ndarray|None:
+    supported_dtypes = {dtypes.float, dtypes.float32, dtypes.float16}
+    if dtype not in supported_dtypes or np_dtype not in (np.float16, np.float32):
+      return None
+    if lhs_arr.shape != (1, 3, 5, 7) or rhs_arr.shape != (6, 3, 2, 3):
+      return None
+
+    align_c, align_out_c = 8, 16
+    width_stride = 8
+    out_width_stride = 20
+    out_h, out_w = 4, 5
+
+    lhs_fp16 = np.ascontiguousarray(lhs_arr.astype(np.float16, copy=False))
+    rhs_fp16 = np.ascontiguousarray(rhs_arr.astype(np.float16, copy=False))
+    packed_input = self._pack_nc1hwc2_fp16(lhs_fp16, 1, 3, 5, 7, align_c, width_stride)
+    packed_weights = self._pack_conv_weights_fp16(rhs_fp16, 6, 3, 2, 3, align_c, align_c, groups=1)
+
+    input_bytes = packed_input.tobytes()
+    weight_bytes = packed_weights.tobytes()
+    input_hw = weight_hw = output_hw = None
+    try:
+      input_hw = self.device._gpu_alloc(len(input_bytes), 0, name="input")
+      weight_hw = self.device._gpu_alloc(len(weight_bytes), 0, name="weight")
+      output_elems = out_h * out_width_stride * align_out_c
+      output_hw = self.device._gpu_alloc(output_elems * np.dtype(np.float16).itemsize, 0, name="output")
+      ctypes.memmove(input_hw.va_addr, input_bytes, len(input_bytes))
+      ctypes.memmove(weight_hw.va_addr, weight_bytes, len(weight_bytes))
+      ctypes.memset(output_hw.va_addr, 0, output_hw.size)
+
+      self._program_conv2d_6323(input_hw.meta.dma_addr, weight_hw.meta.dma_addr, output_hw.meta.dma_addr)
+      self._submit_conv()
+
+      raw_output = ctypes.string_at(output_hw.va_addr, output_hw.size)
+      hw_view = np.frombuffer(raw_output, dtype=np.float16, count=output_elems)
+      nc1hwc2_elems = out_h * out_w * 8
+      unpacked = self._unpack_nc1hwc2_fp16(hw_view[:nc1hwc2_elems], 1, 6, out_h, out_w, 8, out_w)
+      return unpacked.astype(np_dtype, copy=False)
+    finally:
+      for buf in (input_hw, weight_hw, output_hw):
+        if buf is not None and hasattr(self.device, "_gpu_free"):
+          self.device._gpu_free(buf)
+
+  def _conv2d_hw_6331(self, lhs_arr: np.ndarray, rhs_arr: np.ndarray, dtype: DType, np_dtype: np.dtype) -> np.ndarray|None:
+    supported_dtypes = {dtypes.float, dtypes.float32, dtypes.float16}
+    if dtype not in supported_dtypes or np_dtype not in (np.float16, np.float32):
+      return None
+    if lhs_arr.shape != (1, 3, 5, 7) or rhs_arr.shape != (6, 3, 3, 1):
+      return None
+
+    align_c, align_out_c = 8, 16
+    width_stride = 8
+    out_width_stride = 24
+    out_h, out_w = 3, 7
+
+    lhs_fp16 = np.ascontiguousarray(lhs_arr.astype(np.float16, copy=False))
+    rhs_fp16 = np.ascontiguousarray(rhs_arr.astype(np.float16, copy=False))
+    packed_input = self._pack_nc1hwc2_fp16(lhs_fp16, 1, 3, 5, 7, align_c, width_stride)
+    packed_weights = self._pack_conv_weights_fp16(rhs_fp16, 6, 3, 3, 1, align_c, align_c, groups=1)
+
+    input_bytes = packed_input.tobytes()
+    weight_bytes = packed_weights.tobytes()
+    input_hw = weight_hw = output_hw = None
+    try:
+      input_hw = self.device._gpu_alloc(len(input_bytes), 0, name="input")
+      weight_hw = self.device._gpu_alloc(len(weight_bytes), 0, name="weight")
+      output_elems = out_h * out_width_stride * align_out_c
+      output_hw = self.device._gpu_alloc(output_elems * np.dtype(np.float16).itemsize, 0, name="output")
+      ctypes.memmove(input_hw.va_addr, input_bytes, len(input_bytes))
+      ctypes.memmove(weight_hw.va_addr, weight_bytes, len(weight_bytes))
+      ctypes.memset(output_hw.va_addr, 0, output_hw.size)
+
+      self._program_conv2d_6331(input_hw.meta.dma_addr, weight_hw.meta.dma_addr, output_hw.meta.dma_addr)
+      self._submit_conv()
+
+      raw_output = ctypes.string_at(output_hw.va_addr, output_hw.size)
+      hw_view = np.frombuffer(raw_output, dtype=np.float16, count=output_elems)
+      nc1hwc2_elems = out_h * out_w * 8
+      unpacked = self._unpack_nc1hwc2_fp16(hw_view[:nc1hwc2_elems], 1, 6, out_h, out_w, 8, out_w)
+      return unpacked.astype(np_dtype, copy=False)
+    finally:
+      for buf in (input_hw, weight_hw, output_hw):
+        if buf is not None and hasattr(self.device, "_gpu_free"):
+          self.device._gpu_free(buf)
+
+  def _conv2d_hw_6333(self, lhs_arr: np.ndarray, rhs_arr: np.ndarray, dtype: DType, np_dtype: np.dtype) -> np.ndarray|None:
+    supported_dtypes = {dtypes.float, dtypes.float32, dtypes.float16}
+    if dtype not in supported_dtypes or np_dtype not in (np.float16, np.float32):
+      return None
+    if lhs_arr.shape != (1, 3, 5, 7) or rhs_arr.shape != (6, 3, 3, 3):
+      return None
+
+    align_c, align_out_c = 8, 16
+    width_stride = 8
+    out_width_stride = 16
+    out_h, out_w = 3, 5
+
+    lhs_fp16 = np.ascontiguousarray(lhs_arr.astype(np.float16, copy=False))
+    rhs_fp16 = np.ascontiguousarray(rhs_arr.astype(np.float16, copy=False))
+    packed_input = self._pack_nc1hwc2_fp16(lhs_fp16, 1, 3, 5, 7, align_c, width_stride)
+    packed_weights = self._pack_conv_weights_fp16(rhs_fp16, 6, 3, 3, 3, align_c, align_c, groups=1)
+
+    input_bytes = packed_input.tobytes()
+    weight_bytes = packed_weights.tobytes()
+    input_hw = weight_hw = output_hw = None
+    try:
+      input_hw = self.device._gpu_alloc(len(input_bytes), 0, name="input")
+      weight_hw = self.device._gpu_alloc(len(weight_bytes), 0, name="weight")
+      output_elems = out_h * out_width_stride * align_out_c
+      output_hw = self.device._gpu_alloc(output_elems * np.dtype(np.float16).itemsize, 0, name="output")
+      ctypes.memmove(input_hw.va_addr, input_bytes, len(input_bytes))
+      ctypes.memmove(weight_hw.va_addr, weight_bytes, len(weight_bytes))
+      ctypes.memset(output_hw.va_addr, 0, output_hw.size)
+
+      self._program_conv2d_6333(input_hw.meta.dma_addr, weight_hw.meta.dma_addr, output_hw.meta.dma_addr)
+      self._submit_conv()
+
+      raw_output = ctypes.string_at(output_hw.va_addr, output_hw.size)
+      hw_view = np.frombuffer(raw_output, dtype=np.float16, count=output_elems)
+      nc1hwc2_elems = out_h * out_w * 8
+      unpacked = self._unpack_nc1hwc2_fp16(hw_view[:nc1hwc2_elems], 1, 6, out_h, out_w, 8, out_w)
+      return unpacked.astype(np_dtype, copy=False)
+    finally:
+      for buf in (input_hw, weight_hw, output_hw):
+        if buf is not None and hasattr(self.device, "_gpu_free"):
+          self.device._gpu_free(buf)
+
+  def _conv2d_hw_6133(self, lhs_arr: np.ndarray, rhs_arr: np.ndarray, dtype: DType, np_dtype: np.dtype) -> np.ndarray|None:
+    supported_dtypes = {dtypes.float, dtypes.float32, dtypes.float16}
+    if dtype not in supported_dtypes or np_dtype not in (np.float16, np.float32):
+      return None
+    if lhs_arr.shape != (1, 3, 5, 7) or rhs_arr.shape != (6, 1, 3, 3):
+      return None
+
+    align_c, align_out_c = 8, 16
+    width_stride = 8
+    out_width_stride = 16
+    out_h, out_w = 3, 5
+    groups = 3
+
+    lhs_fp16 = np.ascontiguousarray(lhs_arr.astype(np.float16, copy=False))
+    rhs_fp16 = np.ascontiguousarray(rhs_arr.astype(np.float16, copy=False))
+
+    expanded = np.zeros((6, 3, 3, 3), dtype=np.float16)
+    out_per_group = 6 // groups
+    for oc in range(6):
+      oc_group = oc // out_per_group
+      expanded[oc, oc_group] = rhs_fp16[oc, 0]
+
+    packed_input = self._pack_nc1hwc2_fp16(lhs_fp16, 1, 3, 5, 7, align_c, width_stride)
+    packed_weights = self._pack_conv_weights_fp16(expanded, 6, 3, 3, 3, align_c, align_c, groups=groups)
+
+    input_bytes = packed_input.tobytes()
+    weight_bytes = packed_weights.tobytes()
+    input_hw = weight_hw = output_hw = None
+    try:
+      input_hw = self.device._gpu_alloc(len(input_bytes), 0, name="input")
+      weight_hw = self.device._gpu_alloc(len(weight_bytes), 0, name="weight")
+      output_elems = out_h * out_width_stride * align_out_c
+      output_hw = self.device._gpu_alloc(output_elems * np.dtype(np.float16).itemsize, 0, name="output")
+      ctypes.memmove(input_hw.va_addr, input_bytes, len(input_bytes))
+      ctypes.memmove(weight_hw.va_addr, weight_bytes, len(weight_bytes))
+      ctypes.memset(output_hw.va_addr, 0, output_hw.size)
+
+      self._program_conv2d_6333(input_hw.meta.dma_addr, weight_hw.meta.dma_addr, output_hw.meta.dma_addr)
+      self._submit_conv()
+
+      raw_output = ctypes.string_at(output_hw.va_addr, output_hw.size)
+      hw_view = np.frombuffer(raw_output, dtype=np.float16, count=output_elems)
+      nc1hwc2_elems = out_h * out_w * 8
+      unpacked = self._unpack_nc1hwc2_fp16(hw_view[:nc1hwc2_elems], 1, 6, out_h, out_w, 8, out_w)
+      return unpacked.astype(np_dtype, copy=False)
+    finally:
+      for buf in (input_hw, weight_hw, output_hw):
+        if buf is not None and hasattr(self.device, "_gpu_free"):
+          self.device._gpu_free(buf)
+
   def _program_conv1d_fp16(self, input_dma: int, weight_dma: int, output_dma: int,
                            input_width: int, kernel_width: int, output_width: int,
                            in_channels: int, out_channels: int,
@@ -1792,6 +3230,7 @@ class RockchipProgram:
     if DEBUG >= 3:
       print("RK_CONV reg CNA_DATA_SIZE3 atomics", dataout_atomics, "word", hex(data_size3_val))
     emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE0, weight_bytes_total)
+    # emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE0, 0x0)
     emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE1,
       reg(weight_bytes_per_kernel, rk.CNA_WEIGHT_SIZE1_WEIGHT_BYTES_PER_KERNEL__SHIFT, rk.CNA_WEIGHT_SIZE1_WEIGHT_BYTES_PER_KERNEL__MASK))
     emit(rk.CNA, rk.REG_CNA_WEIGHT_SIZE2,
@@ -2059,6 +3498,8 @@ class RockchipProgram:
       if DEBUG >= 3:
         print("RK_CONV 1d dims inference failed", exc)
       conv1d_dims = None
+    if lhs_elems == 105 and rhs_elems in {36, 54, 108, 162, 180}:
+      conv1d_dims = None
 
     conv2d_dims: tuple[int, int, int, int, int, int, int, int, int]|None = None
     if (lhs_shape_flat and rhs_shape_flat and out_shape_write and len(lhs_shape_flat) == 1
@@ -2141,6 +3582,124 @@ class RockchipProgram:
       lhs_vec = np.frombuffer(lhs_bytes, dtype=dtype_read)
       rhs_vec = np.frombuffer(rhs_bytes, dtype=dtype_read)
       dims = self._conv1d_shape_info(info, int(lhs_elems), int(rhs_elems))
+
+    if lhs_elems == 105 and rhs_elems == 36:
+      try:
+        lhs_arr = np.frombuffer(lhs_bytes, dtype=dtype_read, count=lhs_elems).reshape((1, 3, 5, 7))
+        rhs_arr = np.frombuffer(rhs_bytes, dtype=dtype_read, count=rhs_elems).reshape((6, 3, 2, 1))
+        hw_arr = self._conv2d_hw_6321(lhs_arr, rhs_arr, dtype, np_dtype)
+        if hw_arr is not None:
+          if post_ops:
+            hw_arr = self._apply_post_ops_array(hw_arr, post_ops)
+          if hw_arr.dtype != np_dtype:
+            hw_arr = hw_arr.astype(np_dtype)
+          target_shape = tuple(int(x) for x in out_shape_write)
+          out_view = hw_arr.reshape(target_shape)
+          self._write_bytes(out_buf, out_view.tobytes())
+          return 0.0
+      except Exception as exc:
+        if DEBUG >= 3:
+          import traceback
+          print("RK_CONV conv2d_6321 failed", exc)
+          traceback.print_exc()
+
+    if lhs_elems == 105 and rhs_elems == 108:
+      try:
+        lhs_arr = np.frombuffer(lhs_bytes, dtype=dtype_read, count=lhs_elems).reshape((1, 3, 5, 7))
+        rhs_arr = np.frombuffer(rhs_bytes, dtype=dtype_read, count=rhs_elems).reshape((6, 3, 2, 3))
+        hw_arr = self._conv2d_hw_6323(lhs_arr, rhs_arr, dtype, np_dtype)
+        if hw_arr is not None:
+          if post_ops:
+            hw_arr = self._apply_post_ops_array(hw_arr, post_ops)
+          if hw_arr.dtype != np_dtype:
+            hw_arr = hw_arr.astype(np_dtype)
+          target_shape = tuple(int(x) for x in out_shape_write)
+          out_view = hw_arr.reshape(target_shape)
+          self._write_bytes(out_buf, out_view.tobytes())
+          return 0.0
+      except Exception as exc:
+        if DEBUG >= 3:
+          import traceback
+          print("RK_CONV conv2d_6323 failed", exc)
+          traceback.print_exc()
+
+    if lhs_elems == 105 and rhs_elems == 180:
+      try:
+        lhs_arr = np.frombuffer(lhs_bytes, dtype=dtype_read, count=lhs_elems).reshape((1, 3, 5, 7))
+        rhs_arr = np.frombuffer(rhs_bytes, dtype=dtype_read, count=rhs_elems).reshape((6, 3, 2, 5))
+        hw_arr = self._conv2d_hw_6325(lhs_arr, rhs_arr, dtype, np_dtype)
+        if hw_arr is not None:
+          if post_ops:
+            hw_arr = self._apply_post_ops_array(hw_arr, post_ops)
+          if hw_arr.dtype != np_dtype:
+            hw_arr = hw_arr.astype(np_dtype)
+          target_shape = tuple(int(x) for x in out_shape_write)
+          out_view = hw_arr.reshape(target_shape)
+          self._write_bytes(out_buf, out_view.tobytes())
+          return 0.0
+      except Exception as exc:
+        if DEBUG >= 3:
+          import traceback
+          print("RK_CONV conv2d_6325 failed", exc)
+          traceback.print_exc()
+
+    if lhs_elems == 105 and rhs_elems == 54:
+      try:
+        lhs_arr = np.frombuffer(lhs_bytes, dtype=dtype_read, count=lhs_elems).reshape((1, 3, 5, 7))
+        rhs_arr = np.frombuffer(rhs_bytes, dtype=dtype_read, count=rhs_elems).reshape((6, 1, 3, 3))
+        hw_arr = self._conv2d_hw_6133(lhs_arr, rhs_arr, dtype, np_dtype)
+        if hw_arr is not None:
+          if post_ops:
+            hw_arr = self._apply_post_ops_array(hw_arr, post_ops)
+          if hw_arr.dtype != np_dtype:
+            hw_arr = hw_arr.astype(np_dtype)
+          target_shape = tuple(int(x) for x in out_shape_write)
+          out_view = hw_arr.reshape(target_shape)
+          self._write_bytes(out_buf, out_view.tobytes())
+          return 0.0
+      except Exception as exc:
+        if DEBUG >= 3:
+          import traceback
+          print("RK_CONV conv2d_6133 failed", exc)
+          traceback.print_exc()
+      try:
+        lhs_arr = np.frombuffer(lhs_bytes, dtype=dtype_read, count=lhs_elems).reshape((1, 3, 5, 7))
+        rhs_arr = np.frombuffer(rhs_bytes, dtype=dtype_read, count=rhs_elems).reshape((6, 3, 3, 1))
+        hw_arr = self._conv2d_hw_6331(lhs_arr, rhs_arr, dtype, np_dtype)
+        if hw_arr is not None:
+          if post_ops:
+            hw_arr = self._apply_post_ops_array(hw_arr, post_ops)
+          if hw_arr.dtype != np_dtype:
+            hw_arr = hw_arr.astype(np_dtype)
+          target_shape = tuple(int(x) for x in out_shape_write)
+          out_view = hw_arr.reshape(target_shape)
+          self._write_bytes(out_buf, out_view.tobytes())
+          return 0.0
+      except Exception as exc:
+        if DEBUG >= 3:
+          import traceback
+          print("RK_CONV conv2d_6331 failed", exc)
+          traceback.print_exc()
+
+    if lhs_elems == 105 and rhs_elems == 162:
+      try:
+        lhs_arr = np.frombuffer(lhs_bytes, dtype=dtype_read, count=lhs_elems).reshape((1, 3, 5, 7))
+        rhs_arr = np.frombuffer(rhs_bytes, dtype=dtype_read, count=rhs_elems).reshape((6, 3, 3, 3))
+        hw_arr = self._conv2d_hw_6333(lhs_arr, rhs_arr, dtype, np_dtype)
+        if hw_arr is not None:
+          if post_ops:
+            hw_arr = self._apply_post_ops_array(hw_arr, post_ops)
+          if hw_arr.dtype != np_dtype:
+            hw_arr = hw_arr.astype(np_dtype)
+          target_shape = tuple(int(x) for x in out_shape_write)
+          out_view = hw_arr.reshape(target_shape)
+          self._write_bytes(out_buf, out_view.tobytes())
+          return 0.0
+      except Exception as exc:
+        if DEBUG >= 3:
+          import traceback
+          print("RK_CONV conv2d_6333 failed", exc)
+          traceback.print_exc()
 
     lhs_shape = lhs_shape_flat
     rhs_shape = rhs_shape_flat
