@@ -553,6 +553,19 @@ class RockchipDevice(Compiled):
     rk.DRM_IOCTL_RKNPU_MEM_DESTROY(self.fd_ctl, handle=mem.meta.handle, obj_addr=mem.meta.obj_addr, reserved=0)
     FileIOInterface.munmap(mem.va_addr, mem.size)
 
+  def _reset_controller_fd(self, ctl: FileIOInterface|None) -> None:
+    if ctl is None:
+      return
+    fd = getattr(ctl, "fd", -1)
+    if fd < 0:
+      return
+    for _ in range(2):
+      try:
+        rk.DRM_IOCTL_RKNPU_ACTION(ctl, flags=rk.RKNPU_ACT_RESET)
+      except Exception as exc:
+        if DEBUG:
+          print("RK_REOPEN reset failed", exc)
+
   def __init__(self, device:str): 
     self.fd_ctl = FileIOInterface(f"/dev/dri/card1", os.O_RDWR)
     self.task_buf = self._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task")
@@ -565,6 +578,7 @@ class RockchipDevice(Compiled):
 
     self.buffer_list = []
     self.code_for_op = RockchipRenderer.code_for_op
+    self._controller_reopened = False
 
     super().__init__(device, RockchipAllocator(self), RockchipRenderer(), RockchipCompiler(), functools.partial(RockchipProgram, self))
 
@@ -586,6 +600,32 @@ class RockchipDevice(Compiled):
 
   def submission_count(self) -> int:
     return self._submission_total
+
+  def _reopen_controller(self):
+    old_bufs = [self.task_buf, self.cmd_buf] + [item["buf"] for item in self.buffer_list]
+    old_ctl = self.fd_ctl
+    new_ctl = FileIOInterface(f"/dev/dri/card1", os.O_RDWR)
+    self._reset_controller_fd(old_ctl)
+    for buf in old_bufs:
+      if buf is not None:
+        self._gpu_free(buf)
+    self.buffer_list = []
+    self.input_buf = self.weight_buf = self.output_buf = None
+    try:
+      os.close(old_ctl.fd)
+    except Exception:
+      pass
+    if hasattr(old_ctl, "fd"):
+      delattr(old_ctl, "fd")
+    self.fd_ctl = new_ctl
+    self.task_buf = self._gpu_alloc(1024, rk.RKNPU_MEM_KERNEL_MAPPING, name="task")
+    self.cmd_buf = self._gpu_alloc(8192, 0, name="cmd")
+
+  def reset_controller_if_needed(self):
+    if getattr(self, "_controller_reopened", False):
+      return
+    self._controller_reopened = True
+    self._reopen_controller()
 
 class RockchipProgram:
 
@@ -1137,14 +1177,15 @@ class RockchipProgram:
       raise TypeError(f"unsupported buffer type {type(buf)}")
 
   def _submit_conv(self, cmd_sequences:list[list[int]]|None=None) -> None:
-    sequences = cmd_sequences if cmd_sequences is not None else [list(self.q)]
-    if not sequences:
-      return
+    self.device.reset_controller_if_needed()
     try:
       rk.DRM_IOCTL_RKNPU_ACTION(self.device.fd_ctl, flags=rk.RKNPU_ACT_RESET)
     except Exception as exc:
       if DEBUG:
         print("RK_CONV reset failed", exc)
+    sequences = cmd_sequences if cmd_sequences is not None else [list(self.q)]
+    if not sequences:
+      return
     self._submit_count = getattr(self, "_submit_count", 0) + 1
     if hasattr(self.device, "_submission_total"):
       self.device._submission_total += 1
@@ -1196,6 +1237,11 @@ class RockchipProgram:
       tasks[idx].regcfg_amount = 0
       tasks[idx].regcfg_offset = 0
       tasks[idx].regcmd_addr = 0
+    try:
+      rk.DRM_IOCTL_RKNPU_ACTION(self.device.fd_ctl, flags=rk.RKNPU_ACT_RESET)
+    except Exception as exc:
+      if DEBUG:
+        print("RK_CONV post-setup reset failed", exc)
 
     submit_res = rk.struct_rknpu_submit(
       flags=rk.RKNPU_JOB_PC | rk.RKNPU_JOB_BLOCK | rk.RKNPU_JOB_PINGPONG,
@@ -1216,7 +1262,6 @@ class RockchipProgram:
         rk.struct_rknpu_subcore_task(task_start=0, task_number=0),
       ),
     )
-    print("self.device.task_buf.meta.obj_addr", hex(self.device.task_buf.meta.obj_addr))
     os.system("bash -c \"cd ~/npu/ops_rknn/ && python dump.py 2 | grep EMIT | sed 's/\\x1B\\[[0-9;]*[a-zA-Z]//g' | sed 's/^.*EMIT(/EMIT(/' > /tmp/tinygrad_gem2\"")
     if DEBUG >= 3:
       os.system("bash -c 'cd ~/npu/ops_rknn/ && python dump.py 1' ")
@@ -2132,6 +2177,7 @@ class RockchipProgram:
     sample_elems = input_width * in_channels
     if lhs_vec.size != sample_elems * batch_count: return None
     if rhs_vec.size != out_channels * weight_in_channels * kernel_width: return None
+    self.device.reset_controller_if_needed()
 
     lhs_fp16 = np.ascontiguousarray(lhs_vec.astype(np.float16, copy=False))
     rhs_view = np.ascontiguousarray(rhs_vec.astype(np.float16, copy=False))
@@ -2424,6 +2470,7 @@ class RockchipProgram:
     rhs_bytes = rhs_fp16.tobytes()
     window_bytes = max(rhs_fp16.nbytes, 2)
     output_hw_bytes = max(4, np.dtype(np_dtype).itemsize)
+    self.device.reset_controller_if_needed()
 
     input_hw = self.device._gpu_alloc(window_bytes, 0)
     weight_hw = self.device._gpu_alloc(max(len(rhs_bytes), 2), 0)
