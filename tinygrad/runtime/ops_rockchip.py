@@ -1243,18 +1243,24 @@ class RockchipProgram:
         raise RuntimeError(f"Unsupported RK_CONV post-op: {op}")
     return result
 
-  def _pack_matmul_input_8x8_stride32(self, src: np.ndarray, align_in:int) -> np.ndarray:
-    if src.shape != (8, 8):
-      raise ValueError(f"expected 8x8 matmul input, got {src.shape}")
-    packed = np.zeros((8, align_in), dtype=np.float16)
-    packed[:, :8] = src
+  def _pack_matmul_input_stride32(self, src: np.ndarray, align_in:int) -> np.ndarray:
+    if src.ndim != 2:
+      raise ValueError(f"expected 2D matmul input, got {src.shape}")
+    rows, cols = src.shape
+    if cols > align_in:
+      raise ValueError(f"matmul input width {cols} exceeds align_in {align_in}")
+    packed = np.zeros((rows, align_in), dtype=np.float16)
+    packed[:, :cols] = src
     return packed.reshape(-1)
 
-  def _pack_matmul_weight_8x8_column_major(self, src: np.ndarray, align_in:int, align_out:int) -> np.ndarray:
-    if src.shape != (8, 8):
-      raise ValueError(f"expected 8x8 matmul weight, got {src.shape}")
+  def _pack_matmul_weight_column_major(self, src: np.ndarray, align_in:int, align_out:int) -> np.ndarray:
+    if src.ndim != 2:
+      raise ValueError(f"expected 2D matmul weight, got {src.shape}")
+    rows, cols = src.shape
+    if rows > align_in or cols > align_out:
+      raise ValueError(f"matmul weight shape {src.shape} exceeds align_in {align_in} align_out {align_out}")
     packed = np.zeros((align_out, align_in), dtype=np.float16)
-    packed[:8, :8] = src.T
+    packed[:cols, :rows] = src.T
     return packed.reshape(-1)
 
   def _unpack_matmul_output_fp32_with_c2(self, src: np.ndarray, M:int, N:int, c2:int) -> np.ndarray:
@@ -1274,9 +1280,9 @@ class RockchipProgram:
           dst[m, n] = float(src[idx])
     return dst
 
-  def _program_matmul_8x8(self, input_dma:int, weight_dma:int, output_dma:int,
-                          align_in:int, align_out:int, out_height:int,
-                          out_width_stride:int, reset_queue:bool=True) -> None:
+  def _program_matmul_stride32(self, input_dma:int, weight_dma:int, output_dma:int,
+                               align_in:int, align_out:int, out_height:int,
+                               out_width_stride:int, reset_queue:bool=True) -> None:
     dataout_width = 1
     dataout_height = out_height
     data_in_width = dataout_width
@@ -1509,8 +1515,8 @@ class RockchipProgram:
 
     lhs_fp16 = np.ascontiguousarray(lhs_mat.astype(np.float16, copy=False))
     rhs_fp16 = np.ascontiguousarray(rhs_mat.astype(np.float16, copy=False))
-    packed_input = self._pack_matmul_input_8x8_stride32(lhs_fp16, align_in)
-    packed_weight = self._pack_matmul_weight_8x8_column_major(rhs_fp16, align_in, align_out)
+    packed_input = self._pack_matmul_input_stride32(lhs_fp16, align_in)
+    packed_weight = self._pack_matmul_weight_column_major(rhs_fp16, align_in, align_out)
 
     input_bytes = packed_input.tobytes()
     weight_bytes = packed_weight.tobytes()
@@ -1527,8 +1533,8 @@ class RockchipProgram:
       ctypes.memmove(weight_hw.va_addr, weight_bytes, len(weight_bytes))
       ctypes.memset(output_hw.va_addr, 0, output_bytes)
 
-      self._program_matmul_8x8(input_hw.meta.dma_addr, weight_hw.meta.dma_addr, output_hw.meta.dma_addr,
-                               align_in, align_out, out_height, out_width_stride, reset_queue=True)
+      self._program_matmul_stride32(input_hw.meta.dma_addr, weight_hw.meta.dma_addr, output_hw.meta.dma_addr,
+                                    align_in, align_out, out_height, out_width_stride, reset_queue=True)
       self._submit_conv([list(self.q)])
 
       raw_output = ctypes.string_at(output_hw.va_addr, output_bytes)
@@ -1542,6 +1548,59 @@ class RockchipProgram:
         target_shape = target_shape[:-1]
       if not target_shape or int(np.prod(target_shape)) != out_cast.size:
         target_shape = (8, 8)
+      self._write_bytes(out_buf, out_cast.reshape(target_shape).tobytes())
+      return 0.0
+    finally:
+      for buf in (input_hw, weight_hw, output_hw):
+        if buf is not None and hasattr(self.device, "_gpu_free"):
+          self.device._gpu_free(buf)
+
+  def _matmul_9x9_hw(self, lhs_bytes: bytes, rhs_bytes: bytes, dtype_read: np.dtype, dtype: DType,
+                     np_dtype: np.dtype, post_ops: tuple[tuple[Ops, Any], ...],
+                     out_shape_write: tuple[Any, ...], lhs_elems:int, rhs_elems:int, out_buf: Any) -> float:
+    lhs_mat = np.frombuffer(lhs_bytes, dtype=dtype_read, count=lhs_elems).reshape((9, 9))
+    rhs_mat = np.frombuffer(rhs_bytes, dtype=dtype_read, count=rhs_elems).reshape((9, 9))
+
+    align_in = 32
+    align_out = 32
+    out_height = 9
+    out_width_stride = 1
+
+    lhs_fp16 = np.ascontiguousarray(lhs_mat.astype(np.float16, copy=False))
+    rhs_fp16 = np.ascontiguousarray(rhs_mat.astype(np.float16, copy=False))
+    packed_input = self._pack_matmul_input_stride32(lhs_fp16, align_in)
+    packed_weight = self._pack_matmul_weight_column_major(rhs_fp16, align_in, align_out)
+
+    input_bytes = packed_input.tobytes()
+    weight_bytes = packed_weight.tobytes()
+    output_elems = align_out * out_width_stride * out_height
+    output_bytes = output_elems * np.dtype(np.float32).itemsize
+
+    input_hw = weight_hw = output_hw = None
+    try:
+      input_hw = self.device._gpu_alloc(len(input_bytes), 0, name="matmul_input")
+      weight_hw = self.device._gpu_alloc(len(weight_bytes), 0, name="matmul_weight")
+      output_hw = self.device._gpu_alloc(output_bytes, 0, name="matmul_output")
+
+      ctypes.memmove(input_hw.va_addr, input_bytes, len(input_bytes))
+      ctypes.memmove(weight_hw.va_addr, weight_bytes, len(weight_bytes))
+      ctypes.memset(output_hw.va_addr, 0, output_bytes)
+
+      self._program_matmul_stride32(input_hw.meta.dma_addr, weight_hw.meta.dma_addr, output_hw.meta.dma_addr,
+                                    align_in, align_out, out_height, out_width_stride, reset_queue=True)
+      self._submit_conv([list(self.q)])
+
+      raw_output = ctypes.string_at(output_hw.va_addr, output_bytes)
+      packed_output = np.frombuffer(raw_output, dtype=np.float32, count=output_elems)
+      unpacked = self._unpack_matmul_output_fp32_with_c2(packed_output, 9, 9, align_out)
+      if post_ops:
+        unpacked = self._apply_post_ops_array(unpacked, post_ops)
+      out_cast = unpacked.astype(np_dtype, copy=False)
+      target_shape = tuple(int(x) for x in out_shape_write if int(x) > 0)
+      if len(target_shape) == 3 and target_shape[-1] == 1 and target_shape[0] * target_shape[1] == out_cast.size:
+        target_shape = target_shape[:-1]
+      if not target_shape or int(np.prod(target_shape)) != out_cast.size:
+        target_shape = (9, 9)
       self._write_bytes(out_buf, out_cast.reshape(target_shape).tobytes())
       return 0.0
     finally:
@@ -2901,6 +2960,9 @@ class RockchipProgram:
     matmul_dims = self._infer_matmul_dims(lhs_elems, rhs_elems, out_shape_write)
     if matmul_dims == (8, 8, 8):
       return self._matmul_8x8_hw(lhs_bytes, rhs_bytes, dtype_read, dtype, np_dtype, post_ops,
+                                 out_shape_write, lhs_elems, rhs_elems, out_buf)
+    if matmul_dims == (9, 9, 9):
+      return self._matmul_9x9_hw(lhs_bytes, rhs_bytes, dtype_read, dtype, np_dtype, post_ops,
                                  out_shape_write, lhs_elems, rhs_elems, out_buf)
 
     lhs_len_single = int(lhs_elems)
