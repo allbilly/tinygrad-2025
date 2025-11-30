@@ -1285,6 +1285,8 @@ class RockchipProgram:
 
   def _pack_matmul_input_64x64_fp16(self, src: np.ndarray) -> np.ndarray:
     return self._pack_matmul_input_nc1hwc2_fp16(src, align_in=64, out_height=64, c2=8)
+  def _pack_matmul_input_256x256_fp16(self, src: np.ndarray) -> np.ndarray:
+    return self._pack_matmul_input_nc1hwc2_fp16(src, align_in=256, out_height=256, c2=8)
 
   def _pack_matmul_weights_fp16(self, src: np.ndarray, align_in:int, align_out:int) -> np.ndarray:
     if src.ndim != 2:
@@ -1328,6 +1330,8 @@ class RockchipProgram:
 
   def _unpack_matmul_output_64x64_fp32(self, src: np.ndarray) -> np.ndarray:
     return self._unpack_matmul_output_fp32_with_c2(src, 64, 64, 4)
+  def _unpack_matmul_output_256x256_fp32(self, src: np.ndarray) -> np.ndarray:
+    return self._unpack_matmul_output_fp32_with_c2(src, 256, 256, 4)
 
   def _program_matmul_stride32(self, input_dma:int, weight_dma:int, output_dma:int,
                                align_in:int, align_out:int, out_height:int,
@@ -1552,13 +1556,12 @@ class RockchipProgram:
         "dataout_atomics": dataout_atomics,
       }
 
-  def _program_matmul_64x64(self, input_dma:int, weight_dma:int, output_dma:int, reset_queue:bool=True) -> None:
-    align_in = 64
-    align_out = 64
+  def _program_matmul_nc1hwc2(self, input_dma:int, weight_dma:int, output_dma:int,
+                              align_in:int, align_out:int, out_height:int, reset_queue:bool=True) -> None:
     dataout_width = 1
-    dataout_height = 64
+    dataout_height = out_height
     data_in_width = 1
-    data_in_height = 64
+    data_in_height = out_height
     feature_grains = data_in_height + 1
     dataout_atomics = dataout_width * dataout_height
     real_in_channel = align_in - 1
@@ -1568,14 +1571,20 @@ class RockchipProgram:
     weight_bytes_total = weight_bytes_per_kernel * align_out
     cbuf_entries = max(((dataout_width * align_in) + 31) // 32, 1)
     line_stride = data_in_width * 4
-    surf_stride = 60
+    surf_stride = max(data_in_height - 4, 0)
     notch_val = 0
-    dst_surf_stride = 64
+    dst_surf_stride = align_out
     surface_add = dst_surf_stride * 4
-    weight_bank = 11
-    data_bank = 1
-    output_height_minus1 = dataout_height - 1
-    data_cube_width = dataout_width - 1
+    bank_size = 32768
+    total_banks = 12
+    fd_bytes = align_in * data_in_width * data_in_height * np.dtype(np.float16).itemsize
+    data_bank = max((fd_bytes + bank_size - 1) // bank_size, 1)
+    if data_bank >= total_banks:
+      weight_bank = 1
+    else:
+      weight_bank = total_banks - data_bank if weight_bytes_per_kernel <= bank_size else max((weight_bytes_total + bank_size - 1) // bank_size, 1)
+    output_height_minus1 = max(dataout_height - 1, 0)
+    data_cube_width = max(dataout_width - 1, 0)
     if reset_queue:
       self.q = []
     reg = self.reg
@@ -1775,6 +1784,12 @@ class RockchipProgram:
         "dataout_atomics": dataout_atomics,
       }
 
+  def _program_matmul_64x64(self, input_dma:int, weight_dma:int, output_dma:int, reset_queue:bool=True) -> None:
+    self._program_matmul_nc1hwc2(input_dma, weight_dma, output_dma, 64, 64, 64, reset_queue=reset_queue)
+
+  def _program_matmul_256x256(self, input_dma:int, weight_dma:int, output_dma:int, reset_queue:bool=True) -> None:
+    self._program_matmul_nc1hwc2(input_dma, weight_dma, output_dma, 256, 256, 256, reset_queue=reset_queue)
+
   def _matmul_stride32_square_hw(self, dim:int, lhs_bytes: bytes, rhs_bytes: bytes, dtype_read: np.dtype,
                                  dtype: DType, np_dtype: np.dtype, post_ops: tuple[tuple[Ops, Any], ...],
                                  out_shape_write: tuple[Any, ...], lhs_elems:int, rhs_elems:int,
@@ -1887,6 +1902,53 @@ class RockchipProgram:
         target_shape = target_shape[:-1]
       if not target_shape or int(np.prod(target_shape)) != out_cast.size:
         target_shape = (64, 64)
+      self._write_bytes(out_buf, out_cast.reshape(target_shape).tobytes())
+      return 0.0
+    finally:
+      for buf in (input_hw, weight_hw, output_hw):
+        if buf is not None and hasattr(self.device, "_gpu_free"):
+          self.device._gpu_free(buf)
+
+  def _matmul_256x256_hw(self, lhs_bytes: bytes, rhs_bytes: bytes, dtype_read: np.dtype, dtype: DType,
+                         np_dtype: np.dtype, post_ops: tuple[tuple[Ops, Any], ...],
+                         out_shape_write: tuple[Any, ...], lhs_elems:int, rhs_elems:int, out_buf: Any) -> float:
+    lhs_mat = np.frombuffer(lhs_bytes, dtype=dtype_read, count=lhs_elems).reshape((256, 256))
+    rhs_mat = np.frombuffer(rhs_bytes, dtype=dtype_read, count=rhs_elems).reshape((256, 256))
+
+    lhs_fp16 = np.ascontiguousarray(lhs_mat.astype(np.float16, copy=False))
+    rhs_fp16 = np.ascontiguousarray(rhs_mat.astype(np.float16, copy=False))
+    packed_input = self._pack_matmul_input_256x256_fp16(lhs_fp16)
+    packed_weight = self._pack_matmul_weights_fp16(rhs_fp16, 256, 256)
+
+    input_bytes = packed_input.tobytes()
+    weight_bytes = packed_weight.tobytes()
+    output_elems = 256 * 256
+    output_bytes = output_elems * np.dtype(np.float32).itemsize
+
+    input_hw = weight_hw = output_hw = None
+    try:
+      input_hw = self.device._gpu_alloc(len(input_bytes), 0, name="matmul_input")
+      weight_hw = self.device._gpu_alloc(len(weight_bytes), 0, name="matmul_weight")
+      output_hw = self.device._gpu_alloc(output_bytes, 0, name="matmul_output")
+
+      ctypes.memmove(input_hw.va_addr, input_bytes, len(input_bytes))
+      ctypes.memmove(weight_hw.va_addr, weight_bytes, len(weight_bytes))
+      ctypes.memset(output_hw.va_addr, 0, output_bytes)
+
+      self._program_matmul_256x256(input_hw.meta.dma_addr, weight_hw.meta.dma_addr, output_hw.meta.dma_addr, reset_queue=True)
+      self._submit_conv([list(self.q)])
+
+      raw_output = ctypes.string_at(output_hw.va_addr, output_bytes)
+      packed_output = np.frombuffer(raw_output, dtype=np.float32, count=output_elems)
+      unpacked = self._unpack_matmul_output_256x256_fp32(packed_output)
+      if post_ops:
+        unpacked = self._apply_post_ops_array(unpacked, post_ops)
+      out_cast = unpacked.astype(np_dtype, copy=False)
+      target_shape = tuple(int(x) for x in out_shape_write if int(x) > 0)
+      if len(target_shape) == 3 and target_shape[-1] == 1 and target_shape[0] * target_shape[1] == out_cast.size:
+        target_shape = target_shape[:-1]
+      if not target_shape or int(np.prod(target_shape)) != out_cast.size:
+        target_shape = (256, 256)
       self._write_bytes(out_buf, out_cast.reshape(target_shape).tobytes())
       return 0.0
     finally:
@@ -3256,6 +3318,9 @@ class RockchipProgram:
     if matmul_dims == (64, 64, 64):
       return self._matmul_64x64_hw(lhs_bytes, rhs_bytes, dtype_read, dtype, np_dtype, post_ops,
                                    out_shape_write, lhs_elems, rhs_elems, out_buf)
+    if matmul_dims == (256, 256, 256):
+      return self._matmul_256x256_hw(lhs_bytes, rhs_bytes, dtype_read, dtype, np_dtype, post_ops,
+                                     out_shape_write, lhs_elems, rhs_elems, out_buf)
 
     lhs_len_single = int(lhs_elems)
     rhs_len_single = int(rhs_elems)
