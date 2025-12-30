@@ -15,3 +15,6 @@ Never mix functionality changes with whitespace changes. All functionality chang
 ## style
 
 Use **2-space indentation**, and keep lines to a maximum of **150 characters**. Match the existing style.
+
+## Rockchip NPU
+For changes related to NPU or rockchip, never cheat to offload op to CPU or GPU. That's crime.

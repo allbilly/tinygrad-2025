@@ -62,3 +62,6 @@ profile_stats
 *.log
 target
 .mypy_cache
+npu
+userspace_rocket.md
+userspace_rocket
