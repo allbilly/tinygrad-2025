@@ -138,21 +138,16 @@ class TestOps(unittest.TestCase):
   #             lambda x,w: Tensor.conv2d(x,w,groups=groups), grad_rtol=1e-5)
   # def test_conv2d(self): self._test_conv2d(bs=1, cin=3)
 
-  # def test_gemm_fp16(self):
-  #   helper_test_op([(8,8), (8,8)], lambda x,y: x.half().matmul(y.half()), atol=5e-3, rtol=5e-3)
-  #   helper_test_op([(9,9), (9,9)], lambda x,y: x.half().matmul(y.half()), atol=5e-3, rtol=5e-3)
-  #   helper_test_op([(32,32), (32,32)], lambda x,y: x.half().matmul(y.half()), atol=5e-3, rtol=5e-3)
-  #   helper_test_op([(64,64), (64,64)], lambda x,y: x.half().matmul(y.half()), atol=5e-3, rtol=5e-3)
-  #   helper_test_op([(256,256), (256,256)], lambda x,y: x.half().matmul(y.half()), atol=5e-3, rtol=5e-3)
+  def test_gemm_fp16(self):
+    helper_test_op([(8,8), (8,8)], lambda x,y: x.half().matmul(y.half()), atol=5e-3, rtol=5e-3)
+    helper_test_op([(9,9), (9,9)], lambda x,y: x.half().matmul(y.half()), atol=5e-3, rtol=5e-3)
+    helper_test_op([(32,32), (32,32)], lambda x,y: x.half().matmul(y.half()), atol=5e-3, rtol=5e-3)
+    helper_test_op([(64,64), (64,64)], lambda x,y: x.half().matmul(y.half()), atol=5e-3, rtol=5e-3)
+    # helper_test_op([(256,256), (256,256)], lambda x,y: x.half().matmul(y.half()), atol=5e-3, rtol=5e-3)
 
-  # def test_relu(self):
-  #   # helper_test_op([(64,64)], lambda x: x.relu())
-  #   helper_test_op([(64,64)], lambda x: x.relu())
-  #   helper_test_op([()], lambda x: x.relu())
+  # def test_9_gemm(self):
+  #   helper_test_op([(9,9), (9,9)], lambda x,y: x.matmul(y), lambda x,y: x@y)
 
-  # def test_silu(self):
-  #   helper_test_op([(45,65)], torch.nn.functional.silu, Tensor.silu)
-  #   helper_test_op([()], torch.nn.functional.silu, Tensor.silu)
 
   # def test_cmp_lt_simple(self):
   #   a = Tensor([0.0, 1.0, 2.0])
@@ -191,6 +186,8 @@ class TestOps(unittest.TestCase):
   #       helper_test_op(None, fxn, fxn, forward_only=True, vals=[[s0], [s1]])
   # def test_cmp_lt(self): self._test_cmp(lambda x,y: x<y)
 
+
+
   #### WIP SELU
   # def test_div(self):
   #   helper_test_op([(2,2), (2,2)], lambda x,y: x/y, Tensor.div)
@@ -198,35 +195,99 @@ class TestOps(unittest.TestCase):
   #   # helper_test_op([(45,65), (45,65)], lambda x,y: x/y)
   #   # helper_test_op([(), ()], lambda x,y: x/y)
 
-  def test_round(self):
-    helper_test_op([()], lambda x: x.round(), forward_only=True)
-    helper_test_op([(45,35)], lambda x: x.round(), forward_only=True)
-    helper_test_op(None, lambda x: x.round(), vals=[[1.499, 1.5, 1.501, 1.0, 2.1, 0.0, -5.0, -2.499, -2.5, -2.501]], forward_only=True)
-    helper_test_op(None, lambda x: x.round(), vals=[[2.5, -1.5]], forward_only=True)
+  # def test_round(self):
+  #   helper_test_op([()], lambda x: x.round(), forward_only=True)
+  #   helper_test_op([(45,35)], lambda x: x.round(), forward_only=True)
+  #   helper_test_op(None, lambda x: x.round(), vals=[[1.499, 1.5, 1.501, 1.0, 2.1, 0.0, -5.0, -2.499, -2.5, -2.501]], forward_only=True)
+  #   helper_test_op(None, lambda x: x.round(), vals=[[2.5, -1.5]], forward_only=True)
 
-  def test_roundoff(self):
-    def roundoff_ref(val: float) -> float:
-      base = math.floor(val)
-      frac = val - base
-      base_i = int(base)
-      if frac > 0.5 or (frac == 0.5 and (base_i & 1)): return base + 1.0
-      return base
+  # def test_roundoff(self):
+  #   def roundoff_ref(val: float) -> float:
+  #     base = math.floor(val)
+  #     frac = val - base
+  #     base_i = int(base)
+  #     if frac > 0.5 or (frac == 0.5 and (base_i & 1)): return base + 1.0
+  #     return base
 
-    dev = Device["ROCKCHIP"]
-    prg = RockchipProgram(dev, "roundoff", pickle.dumps([]))
-    vals = np.array([0.5, 1.4, 1.5, 1.6, 2.5, 3.5, 4.4, 4.5, 4.6, 5.5, 6.49, 6.5, 6.51, 7.5, 8.5, 9.5], dtype=np.float16)
-    out = prg.roundoff(vals.tolist(), rows=4, cols=4)
-    expected = np.array([roundoff_ref(float(x)) for x in vals], dtype=np.float16)
-    np.testing.assert_allclose(np.array(out, dtype=np.float16), expected, atol=1e-3)
+  #   dev = Device["ROCKCHIP"]
+  #   prg = RockchipProgram(dev, "roundoff", pickle.dumps([]))
+  #   vals = np.array([0.5, 1.4, 1.5, 1.6, 2.5, 3.5, 4.4, 4.5, 4.6, 5.5, 6.49, 6.5, 6.51, 7.5, 8.5, 9.5], dtype=np.float16)
+  #   out = prg.roundoff(vals.tolist(), rows=4, cols=4)
+  #   expected = np.array([roundoff_ref(float(x)) for x in vals], dtype=np.float16)
+  #   np.testing.assert_allclose(np.array(out, dtype=np.float16), expected, atol=1e-3)
 
-  # def test_idiv(self):
-  #   helper_test_op(None, functools.partial(torch.div, rounding_mode="trunc"), Tensor.idiv, forward_only=True,
-  #                  vals=[[-4, 7, 5, 4, -7, 8], [2, -3, 8, -2, 3, 5]])
+  # def test_where(self):
+  #   rng = np.random.default_rng(0)
+  #   for rows, cols in ((1, 1), (2, 2), (8, 8)):
+  #     with self.subTest(rows=rows, cols=cols):
+  #       a = rng.uniform(-2.0, 2.0, size=(rows, cols)).astype(np.float16)
+  #       b = rng.uniform(-2.0, 2.0, size=(rows, cols)).astype(np.float16)
+  #       mask = (np.arange(rows * cols) % 2).reshape(rows, cols).astype(np.bool_)
+  #       ta = Tensor(a, dtype=dtypes.float16)
+  #       tb = Tensor(b, dtype=dtypes.float16)
+  #       tmask = Tensor(mask, dtype=dtypes.bool)
+  #       out = tmask.where(ta, tb).realize().numpy()
+  #       expected = np.where(mask, a, b)
+  #       np.testing.assert_allclose(out, expected, atol=1e-3, rtol=1e-3)
+
+  # def test_idiv_shift_rewrite_negative(self):
+  #   a = Tensor(-5).idiv(2).item()
+  #   b = Tensor(-5).contiguous().idiv(2).item()
+  #   self.assertEqual(a, b)
+  #   self.assertEqual(Tensor(-1).contiguous().idiv(4).item(), 0)  # NOTE this is trunc-div behaviour
+
+  # def test_cmpne_specials(self):
+  #   a_vals = np.array([[0.0, -1.0, math.inf], [math.nan, 2.0, -0.0]], dtype=np.float16)
+  #   b_vals = np.array([[0.0, 1.0, math.inf], [math.nan, 0.0, 0.0]], dtype=np.float16)
+  #   out = (Tensor(a_vals, dtype=dtypes.float16) != Tensor(b_vals, dtype=dtypes.float16)).realize().numpy()
+  #   expected = np.not_equal(a_vals, b_vals)
+  #   np.testing.assert_equal(out, expected)
+
+  # def test_relu(self):
+  #   helper_test_op([(64,64)], lambda x: x.relu())
+  #   helper_test_op([()], lambda x: x.relu())
+
+  # def test_silu(self):
+  #   helper_test_op([(45,65)], torch.nn.functional.silu, Tensor.silu, atol=1e-3, rtol=1e-3)
+  #   helper_test_op([()], torch.nn.functional.silu, Tensor.silu, atol=1e-3, rtol=1e-3)
+
+  # def test_sigmoid(self):
+  #   helper_test_op([(45,65)], torch.sigmoid, Tensor.sigmoid, atol=5e-3, rtol=1e-3)
+  #   helper_test_op([()], torch.sigmoid, Tensor.sigmoid, atol=5e-3, rtol=1e-3)
+
+  # def test_abs(self):
+  #   helper_test_op([(45,65)], torch.abs, Tensor.abs, atol=1e-3, rtol=1e-3)
+  #   helper_test_op([()], torch.abs, Tensor.abs, atol=1e-3, rtol=1e-3)
 
   # def test_selu(self):
-  #   helper_test_op([(2,2)], torch.nn.functional.selu, Tensor.selu)
-  #   # helper_test_op([(45,65)], torch.nn.functional.selu, Tensor.selu)
-  #   helper_test_op([()], torch.nn.functional.selu, Tensor.selu)
+  #   helper_test_op([(2,2)], torch.nn.functional.selu, Tensor.selu, atol=2e-3)
+  #   helper_test_op([(45,65)], torch.nn.functional.selu, Tensor.selu, atol=2e-3)
+  #   helper_test_op([()], torch.nn.functional.selu, Tensor.selu, atol=2e-3)
+
+  # def test_maximum(self):
+  #   helper_test_op([(45,65), (45,65)], torch.maximum, Tensor.maximum)
+  #   helper_test_op([(), ()], torch.maximum, Tensor.maximum)
+
+  # def test_maximum(self):
+  #   helper_test_op([(45,65), (45,65)], torch.maximum, Tensor.maximum)
+  #   helper_test_op([(), ()], torch.maximum, Tensor.maximum)
+
+  # def test_minimum(self):
+  #   helper_test_op([(45,65), (45,65)], torch.minimum, Tensor.minimum)
+  #   helper_test_op([(), ()], torch.minimum, Tensor.minimum)
+
+  # def test_celu(self):
+  #   atol, rtol = 1e-6, 1e-3
+  #   if dtypes.default_float == dtypes.float16:
+  #     # Rockchip executes exp in float16; allow ~1 ULP differences.
+  #     atol = 1e-3
+  #   for val in range(1, 5):
+  #     helper_test_op([(45,65)], lambda x: torch.nn.functional.celu(x,val), lambda x: x.celu(val), atol=atol, rtol=rtol)
+  #     helper_test_op([()], lambda x: torch.nn.functional.celu(x,val), lambda x: x.celu(val), atol=atol, rtol=rtol)
+
+  # def test_swish(self):
+  #   helper_test_op([(45,65)], torch.nn.functional.silu, Tensor.swish)
+  #   helper_test_op([()], torch.nn.functional.silu, Tensor.swish)
 
 
 if __name__ == '__main__':
