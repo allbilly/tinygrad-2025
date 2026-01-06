@@ -719,6 +719,29 @@ def _parse_conv_metadata(name:str) -> tuple[str, dict[str, tuple[int, ...]]]:
     data[key] = tuple(int(x) for x in val.split(",") if x)
   return base, data
 
+def _wmma_layout_from_arg(arg: Any) -> dict[str, int]|None:
+  if not isinstance(arg, tuple) or len(arg) < 2:
+    return None
+  if len(arg) > 7 and isinstance(arg[7], dict):
+    layout = arg[7].get("rockchip")
+    if isinstance(layout, dict):
+      align_in = layout.get("align_in")
+      align_out = layout.get("align_out")
+      out_height = layout.get("out_height")
+      if None not in (align_in, align_out, out_height):
+        return {"align_in": int(align_in), "align_out": int(align_out), "out_height": int(out_height)}
+  dims = arg[1]
+  if not isinstance(dims, tuple) or len(dims) != 3:
+    return None
+  N, M, K = (int(x) for x in dims)
+  if M != N or N != K:
+    return None
+  if N in (8, 9, 32):
+    return {"align_in": 32, "align_out": 32, "out_height": N}
+  if N in (64, 256):
+    return {"align_in": N, "align_out": N, "out_height": N}
+  return None
+
 
 class RockchipRenderer(Renderer):
   device = "ROCKCHIP"
@@ -743,6 +766,11 @@ class RockchipRenderer(Renderer):
       for u in uops:
         if u.metadata:
           print("RK_RENDER metadata", u.op, u.metadata)
+    def _find_global_id(node:UOp) -> int|None:
+      for parent in node.toposort():
+        if parent.op is Ops.DEFINE_GLOBAL:
+          return parent.arg
+      return None
     conv = next((u for u in uops if u.op is Ops.CUSTOM and isinstance(u.arg, RockchipConvInfo)), None)
     def _find_store_for_conv(conv_node:UOp) -> UOp|None:
       for store in uops:
@@ -790,11 +818,6 @@ class RockchipRenderer(Renderer):
         if DEBUG >= 3:
           print("RK_CONV render fallback: missing RockchipConvInfo", conv)
       else:
-        def _find_global_id(node:UOp) -> int|None:
-          for parent in node.toposort():
-            if parent.op is Ops.DEFINE_GLOBAL:
-              return parent.arg
-          return None
         store_uop = _find_store_for_conv(conv)
         if store_uop is None:
           if DEBUG >= 3:
@@ -811,6 +834,33 @@ class RockchipRenderer(Renderer):
             metadata = {"globals_order": globals_order, "out": out_gid, "lhs": lhs_gid, "rhs": rhs_gid}
             payload = ("RK_CONV", conv.dtype, info_value, metadata)
             return base64.b64encode(pickle.dumps(payload)).decode()
+
+    wmma = next((u for u in uops if u.op is Ops.WMMA), None)
+    if wmma is not None:
+      def _find_store_for_wmma(wmma_node:UOp) -> UOp|None:
+        for store in uops:
+          if store.op is not Ops.STORE: continue
+          if len(store.src) > 1 and _depends_on(store.src[1], wmma_node):
+            return store
+        return None
+      def _find_global_id_from_src(node:UOp) -> int|None:
+        for parent in node.toposort():
+          if parent.op is Ops.DEFINE_GLOBAL:
+            return parent.arg
+        return None
+      store_uop = _find_store_for_wmma(wmma)
+      if store_uop is not None:
+        out_gid = _find_global_id(store_uop.src[0])
+        lhs_gid = _find_global_id_from_src(wmma.src[0])
+        rhs_gid = _find_global_id_from_src(wmma.src[1])
+        if None not in (out_gid, lhs_gid, rhs_gid):
+          globals_order = tuple(u.arg for u in uops if u.op is Ops.DEFINE_GLOBAL)
+          metadata = {"globals_order": globals_order, "out": out_gid, "lhs": lhs_gid, "rhs": rhs_gid}
+          wmma_layout = _wmma_layout_from_arg(wmma.arg)
+          if wmma_layout is not None:
+            metadata["wmma"] = wmma_layout
+          payload = ("RK_WMMA", wmma.dtype, wmma.arg, metadata)
+          return base64.b64encode(pickle.dumps(payload)).decode()
 
     # the value of SPECIAL comes from local/global_size, not form its source
     lops = [(u.op, u.dtype, [uops.index(v) for v in u.src if u.op is not Ops.SPECIAL], u.arg) for u in uops]
@@ -2710,6 +2760,11 @@ class RockchipProgram:
     n = len(a)
     if n != len(b): raise RuntimeError(f"ADD int16 input length mismatch {n} != {len(b)}")
     if n == 0: return []
+    if n > 2048:
+      out = []
+      for off in range(0, n, 2048):
+        out.extend(self._add_part1_int16(a[off:off+2048], b[off:off+2048], None))
+      return out
 
     a_i16 = np.asarray(a, dtype=np.int16)
     b_i16 = np.asarray(b, dtype=np.int16)
@@ -2784,6 +2839,11 @@ class RockchipProgram:
     n = len(a)
     if n != len(b): raise RuntimeError(f"MUL int16 input length mismatch {n} != {len(b)}")
     if n == 0: return []
+    if n > 2048:
+      out = []
+      for off in range(0, n, 2048):
+        out.extend(self._mul_part1_int16(a[off:off+2048], b[off:off+2048], None))
+      return out
 
     a_i16 = np.asarray(a, dtype=np.int16)
     b_i16 = np.asarray(b, dtype=np.int16)
@@ -3394,6 +3454,8 @@ class RockchipProgram:
     self.emit_raw(rk.DPU, rk.REG_DPU_EW_OP_VALUE_7, 0);
  
   def submit(self):
+    self.device.reset_controller_if_needed()
+    self._bump_submit("RK_EW")
     #self.q.append(0x2001000178495044), # 63
     self.emit_raw(0x00, 0x00, 0);
     self.emit_raw(rk.DPU, rk.REG_PC_REGISTER_AMOUNTS, 0);  
@@ -3447,6 +3509,18 @@ class RockchipProgram:
       print("DRM_IOCTL_RKNPU_SUBMIT")
     rk.DRM_IOCTL_RKNPU_SUBMIT(self.device.fd_ctl, __payload=submit_res)
 
+  def _bump_submit(self, tag:str) -> None:
+    self._submit_count = getattr(self, "_submit_count", 0) + 1
+    tag_counts = getattr(self, "_submit_tag_counts", None)
+    if tag_counts is None:
+      tag_counts = {}
+      self._submit_tag_counts = tag_counts
+    tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    if hasattr(self.device, "_submission_total"):
+      self.device._submission_total += 1
+    if DEBUG >= 3:
+      print(f"{tag} submit count {self._submit_count} ({tag_counts[tag]} {tag})")
+
   def __init__(self, dev:RockchipDevice, name:str, lib:bytes):
     loaded = pickle.loads(lib)
     if isinstance(loaded, list):
@@ -3454,6 +3528,8 @@ class RockchipProgram:
       self._rk_conv_payload: tuple[Any, ...]|None = None
       if DEBUG >= 3:
         print("RockchipProgram uops sample", self.uops[:15])
+        if any(op is Ops.WMMA for op,_,_,_ in self.uops):
+          print("RockchipProgram WMMA uops present")
     else:
       self.uops = []
       self._rk_conv_payload = loaded
@@ -3468,7 +3544,12 @@ class RockchipProgram:
 
   def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
     if self._rk_conv_payload is not None:
-      return self._execute_rk_conv(bufs, wait=wait)
+      tag = self._rk_conv_payload[0]
+      if tag == "RK_CONV":
+        return self._execute_rk_conv(bufs, wait=wait)
+      if tag == "RK_WMMA":
+        return self._execute_rk_wmma(bufs, wait=wait)
+      raise RuntimeError(f"unexpected Rockchip payload tag {tag}")
     st = time.perf_counter()
     warp = list(itertools.product(*[range(x) for x in local_size[::-1]]))
     warp_size = len(warp)
@@ -3835,6 +3916,26 @@ class RockchipProgram:
             else: ul[i] = self._mul_part1_int16(inp[0], inp[1], shape)
             i += 1
             continue
+          if len(inp) == 2 and uop in (Ops.ADD, Ops.MUL) and dtype in (dtypes.int32, dtypes.int):
+            shape = None
+            if len(inp[0]) and len(inp[1]):
+              a_min, a_max = min(inp[0]), max(inp[0])
+              b_min, b_max = min(inp[1]), max(inp[1])
+            else:
+              a_min = a_max = b_min = b_max = 0
+            if uop is Ops.ADD:
+              if a_min + b_min >= -32768 and a_max + b_max <= 32767:
+                out = self._add_part1_int16(inp[0], inp[1], shape)
+                ul[i] = [int(x) for x in out]
+                i += 1
+                continue
+            else:
+              cand = [a_min*b_min, a_min*b_max, a_max*b_min, a_max*b_max]
+              if min(cand) >= -32768 and max(cand) <= 32767:
+                out = self._mul_part1_int16(inp[0], inp[1], shape)
+                ul[i] = [int(x) for x in out]
+                i += 1
+                continue
           if (len(inp) == 2
               and (dtype in (dtypes.int8, dtypes.int16, dtypes.int32, dtypes.int, dtypes.float, dtypes.float16))
               and (uop in RockchipRenderer.code_for_op.keys())):
@@ -3845,95 +3946,88 @@ class RockchipProgram:
             elif dtype == dtypes.int16: io_dtype = dtypes.int16
             elif dtype == dtypes.int8: io_dtype = dtypes.int8
 
-            self.device.add_buffer(len(inp[0]) * io_dtype.itemsize)
-
-            self.input_buf = self.device.input_buf
-            self.weight_buf = self.device.weight_buf
-            self.output_buf = self.device.output_buf
-
-         
             import numpy as np
-            self.create_reg()
-            if io_dtype == dtypes.float16:
-              src = memoryview(bytearray(np.float16(inp[0]).tobytes()))
-              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
-              src2 = memoryview(bytearray(np.float16(inp[1]).tobytes()))
-              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-              # FIX ME
-              dst = np.frombuffer((bytearray(self.output_buf.size)), dtype=np.float16)
-              # dst = np.frombuffer((bytearray(self.output_buf.size * dtypes.float32.itemsize)), dtype=np.float32)
-              
-              self.ops(uop, dtypes.float16)
-   
-            elif io_dtype == dtypes.int32:
-              src = memoryview(bytearray(np.int32(inp[0]).tobytes()))
-              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
-              src2 = memoryview(bytearray(np.int32(inp[1]).tobytes()))
-              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-              dst = np.frombuffer((bytearray(self.output_buf.size)), dtype=np.int32)
+            def run_chunk(chunk_a:list[Any], chunk_b:list[Any]) -> list[Any]:
+              self.device.add_buffer(len(chunk_a) * io_dtype.itemsize)
+              self.input_buf = self.device.input_buf
+              self.weight_buf = self.device.weight_buf
+              self.output_buf = self.device.output_buf
+              self.create_reg()
+              if io_dtype == dtypes.float16:
+                src = memoryview(bytearray(np.float16(chunk_a).tobytes()))
+                ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+                src2 = memoryview(bytearray(np.float16(chunk_b).tobytes()))
+                ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+                dst = np.frombuffer((bytearray(self.output_buf.size)), dtype=np.float16)
+                self.ops(uop, dtypes.float16)
+              elif io_dtype == dtypes.int32:
+                src = memoryview(bytearray(np.int32(chunk_a).tobytes()))
+                ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+                src2 = memoryview(bytearray(np.int32(chunk_b).tobytes()))
+                ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+                dst = np.frombuffer((bytearray(self.output_buf.size)), dtype=np.int32)
+                self.ops(uop, dtypes.int32)
+              elif io_dtype == dtypes.int16:
+                src = memoryview(bytearray(np.int16(chunk_a).tobytes()))
+                ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+                src2 = memoryview(bytearray(np.int16(chunk_b).tobytes()))
+                ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+                dst = np.frombuffer((bytearray(self.output_buf.size)), dtype=np.int16)
+                self.ops(uop, dtypes.int16)
+              elif io_dtype == dtypes.int8:
+                src = memoryview(bytearray(np.int8(chunk_a).tobytes()))
+                ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
+                src2 = memoryview(bytearray(np.int8(chunk_b).tobytes()))
+                ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
+                dst = np.frombuffer((bytearray(self.output_buf.size)), dtype=np.int8)
+                self.ops(uop, dtypes.int8)
 
-              self.ops(uop, dtypes.int32)
+              cols = len(chunk_a) if len(chunk_a) > 0 else 1
+              data_cube_width = cols - 1
+              stride_field = cols * io_dtype.itemsize
+              channel = 0
+              self.emit_raw(rk.DPU, rk.REG_DPU_DST_SURF_STRIDE,
+                self.reg(stride_field, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__SHIFT, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__MASK))
+              self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH,
+                self.reg(data_cube_width, rk.DPU_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_DATA_CUBE_WIDTH_WIDTH__MASK))
+              self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_HEIGHT,
+                self.reg(0, rk.DPU_DATA_CUBE_HEIGHT_HEIGHT__SHIFT, rk.DPU_DATA_CUBE_HEIGHT_HEIGHT__MASK))
+              self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL,
+                self.reg(channel, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__MASK) |
+                self.reg(channel, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__MASK))
+              self.emit_raw(rk.DPU, rk.REG_DPU_WDMA_SIZE_0,
+                self.reg(channel, rk.DPU_WDMA_SIZE_0_CHANNEL_WDMA__SHIFT, rk.DPU_WDMA_SIZE_0_CHANNEL_WDMA__MASK))
+              self.emit_raw(rk.DPU, rk.REG_DPU_WDMA_SIZE_1,
+                self.reg(0, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__MASK) |
+                self.reg(data_cube_width, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__MASK))
+              self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,
+                self.reg(data_cube_width, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__MASK))
+              self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,
+                self.reg(0, rk.DPU_RDMA_RDMA_DATA_CUBE_HEIGHT_HEIGHT__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_HEIGHT_HEIGHT__MASK))
+              self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,
+                self.reg(channel, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__MASK))
+              self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_SURF_STRIDE,
+                self.reg(stride_field, rk.DPU_RDMA_RDMA_EW_SURF_STRIDE_EW_SURF_STRIDE__SHIFT, rk.DPU_RDMA_RDMA_EW_SURF_STRIDE_EW_SURF_STRIDE__MASK))
+              self.emit_raw(rk.DPU, rk.REG_DPU_SURFACE_ADD,
+                self.reg(stride_field, rk.DPU_SURFACE_ADD_SURF_ADD__SHIFT, rk.DPU_SURFACE_ADD_SURF_ADD__MASK))
+              self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, 
+                  self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
+              self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
+                self.reg(self.input_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
+              self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
+                self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
+              self.submit()
+              ctypes.memmove(dst.ctypes.data, self.output_buf.va_addr, self.output_buf.size)
+              return dst.tolist()
 
-            elif io_dtype == dtypes.int16:
-              src = memoryview(bytearray(np.int16(inp[0]).tobytes()))
-              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
-              src2 = memoryview(bytearray(np.int16(inp[1]).tobytes()))
-              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-              dst = np.frombuffer((bytearray(self.output_buf.size)), dtype=np.int16)
-
-              self.ops(uop, dtypes.int16)
-
-            elif io_dtype == dtypes.int8:
-              src = memoryview(bytearray(np.int8(inp[0]).tobytes()))
-              ctypes.memmove(self.input_buf.va_addr, mv_address(src), src.nbytes)
-              src2 = memoryview(bytearray(np.int8(inp[1]).tobytes()))
-              ctypes.memmove(self.weight_buf.va_addr, mv_address(src2), src2.nbytes)
-              dst = np.frombuffer((bytearray(self.output_buf.size)), dtype=np.int8)
-
-              self.ops(uop, dtypes.int8)
-
-            cols = len(inp[0]) if len(inp[0]) > 0 else 1
-            data_cube_width = cols - 1
-            stride_field = cols * io_dtype.itemsize
-            channel = 0
-            self.emit_raw(rk.DPU, rk.REG_DPU_DST_SURF_STRIDE,
-              self.reg(stride_field, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__SHIFT, rk.DPU_DST_SURF_STRIDE_DST_SURF_STRIDE__MASK))
-            self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_WIDTH,
-              self.reg(data_cube_width, rk.DPU_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_DATA_CUBE_WIDTH_WIDTH__MASK))
-            self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_HEIGHT,
-              self.reg(0, rk.DPU_DATA_CUBE_HEIGHT_HEIGHT__SHIFT, rk.DPU_DATA_CUBE_HEIGHT_HEIGHT__MASK))
-            self.emit_raw(rk.DPU, rk.REG_DPU_DATA_CUBE_CHANNEL,
-              self.reg(channel, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_ORIG_CHANNEL__MASK) |
-              self.reg(channel, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_DATA_CUBE_CHANNEL_CHANNEL__MASK))
-            self.emit_raw(rk.DPU, rk.REG_DPU_WDMA_SIZE_0,
-              self.reg(channel, rk.DPU_WDMA_SIZE_0_CHANNEL_WDMA__SHIFT, rk.DPU_WDMA_SIZE_0_CHANNEL_WDMA__MASK))
-            self.emit_raw(rk.DPU, rk.REG_DPU_WDMA_SIZE_1,
-              self.reg(0, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_HEIGHT_WDMA__MASK) |
-              self.reg(data_cube_width, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__SHIFT, rk.DPU_WDMA_SIZE_1_WIDTH_WDMA__MASK))
-            self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_WIDTH,
-              self.reg(data_cube_width, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_WIDTH_WIDTH__MASK))
-            self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_HEIGHT,
-              self.reg(0, rk.DPU_RDMA_RDMA_DATA_CUBE_HEIGHT_HEIGHT__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_HEIGHT_HEIGHT__MASK))
-            self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_DATA_CUBE_CHANNEL,
-              self.reg(channel, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__SHIFT, rk.DPU_RDMA_RDMA_DATA_CUBE_CHANNEL_CHANNEL__MASK))
-            self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_SURF_STRIDE,
-              self.reg(stride_field, rk.DPU_RDMA_RDMA_EW_SURF_STRIDE_EW_SURF_STRIDE__SHIFT, rk.DPU_RDMA_RDMA_EW_SURF_STRIDE_EW_SURF_STRIDE__MASK))
-            self.emit_raw(rk.DPU, rk.REG_DPU_SURFACE_ADD,
-              self.reg(stride_field, rk.DPU_SURFACE_ADD_SURF_ADD__SHIFT, rk.DPU_SURFACE_ADD_SURF_ADD__MASK))
-            self.emit_raw(rk.DPU, rk.REG_DPU_DST_BASE_ADDR, 
-                self.reg(self.output_buf.meta.dma_addr, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__SHIFT, rk.DPU_DST_BASE_ADDR_DST_BASE_ADDR__MASK))
-            self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_SRC_BASE_ADDR,
-              self.reg(self.input_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_SRC_BASE_ADDR_SRC_BASE_ADDR__MASK))
-            self.emit_raw(rk.DPU_RDMA, rk.REG_DPU_RDMA_RDMA_EW_BASE_ADDR,
-              self.reg(self.weight_buf.meta.dma_addr, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__SHIFT, rk.DPU_RDMA_RDMA_EW_BASE_ADDR_EW_BASE_ADDR__MASK))
-          
-            self.submit()
-            ctypes.memmove(dst.ctypes.data, self.output_buf.va_addr, self.output_buf.size)
-            # print("inp[0]", inp[0])            
-            # print(uop)
-            # print("inp[1]", inp[1])
-            # print("dst", dst.tolist())
-            ul[i] = dst.tolist()
+            max_cols = 2048
+            if len(inp[0]) > max_cols:
+              out:list[Any] = []
+              for off in range(0, len(inp[0]), max_cols):
+                out.extend(run_chunk(inp[0][off:off+max_cols], inp[1][off:off+max_cols]))
+              ul[i] = out
+            else:
+              ul[i] = run_chunk(inp[0], inp[1])
           else:
             # Only allow fallback for simple logical ops.
             allow_fallback = uop in (Ops.XOR, Ops.AND, Ops.OR, Ops.TRUNC)
@@ -4023,7 +4117,7 @@ class RockchipProgram:
     else:
       raise TypeError(f"unsupported buffer type {type(buf)}")
 
-  def _submit_conv(self, cmd_sequences:list[list[int]]|None=None) -> None:
+  def _submit_conv(self, cmd_sequences:list[list[int]]|None=None, tag:str="RK_CONV") -> None:
     self.device.reset_controller_if_needed()
     try:
       rk.DRM_IOCTL_RKNPU_ACTION(self.device.fd_ctl, flags=rk.RKNPU_ACT_RESET)
@@ -4033,16 +4127,13 @@ class RockchipProgram:
     sequences = cmd_sequences if cmd_sequences is not None else [list(self.q)]
     if not sequences:
       return
-    self._submit_count = getattr(self, "_submit_count", 0) + 1
-    if hasattr(self.device, "_submission_total"):
-      self.device._submission_total += 1
+    self._bump_submit(tag)
     if DEBUG >= 3:
-      print(f"RK_CONV submit count {self._submit_count}")
       conv_debug = getattr(self, "_rk_conv_debug", None)
       if conv_debug is not None:
         input_dma, weight_dma, output_dma = conv_debug["dma"]
-        print(f"RK_CONV DMA input {input_dma:#x} weight {weight_dma:#x} output {output_dma:#x}")
-        print(f"RK_CONV stride {conv_debug['dst_stride']} surface_add {conv_debug['surface_add']} batch {conv_debug['batch_count']}")
+        print(f"{tag} DMA input {input_dma:#x} weight {weight_dma:#x} output {output_dma:#x}")
+        print(f"{tag} stride {conv_debug['dst_stride']} surface_add {conv_debug['surface_add']} batch {conv_debug['batch_count']}")
     tasks = ctypes.cast(self.device.task_buf.va_addr, ctypes.POINTER(rk.struct_rknpu_task * 128)).contents
     reg_entries = self.device.cmd_buf.size // ctypes.sizeof(ctypes.c_uint64)
     reg_array_type = ctypes.c_uint64 * reg_entries
@@ -4685,7 +4776,7 @@ class RockchipProgram:
   def _matmul_stride32_square_hw(self, dim:int, lhs_bytes: bytes, rhs_bytes: bytes, dtype_read: np.dtype,
                                  dtype: DType, np_dtype: np.dtype, post_ops: tuple[tuple[Ops, Any], ...],
                                  out_shape_write: tuple[Any, ...], lhs_elems:int, rhs_elems:int,
-                                 out_buf: Any) -> float:
+                                 out_buf: Any, tag:str="RK_CONV") -> float:
     lhs_mat = np.frombuffer(lhs_bytes, dtype=dtype_read, count=lhs_elems).reshape((dim, dim))
     rhs_mat = np.frombuffer(rhs_bytes, dtype=dtype_read, count=rhs_elems).reshape((dim, dim))
 
@@ -4716,7 +4807,7 @@ class RockchipProgram:
 
       self._program_matmul_stride32(input_hw.meta.dma_addr, weight_hw.meta.dma_addr, output_hw.meta.dma_addr,
                                     align_in, align_out, out_height, out_width_stride, reset_queue=True)
-      self._submit_conv([list(self.q)])
+      self._submit_conv([list(self.q)], tag=tag)
 
       raw_output = ctypes.string_at(output_hw.va_addr, output_bytes)
       packed_output = np.frombuffer(raw_output, dtype=np.float32, count=output_elems)
@@ -4738,25 +4829,29 @@ class RockchipProgram:
 
   def _matmul_8x8_hw(self, lhs_bytes: bytes, rhs_bytes: bytes, dtype_read: np.dtype, dtype: DType,
                      np_dtype: np.dtype, post_ops: tuple[tuple[Ops, Any], ...],
-                     out_shape_write: tuple[Any, ...], lhs_elems:int, rhs_elems:int, out_buf: Any) -> float:
+                     out_shape_write: tuple[Any, ...], lhs_elems:int, rhs_elems:int, out_buf: Any,
+                     tag:str="RK_CONV") -> float:
     return self._matmul_stride32_square_hw(8, lhs_bytes, rhs_bytes, dtype_read, dtype, np_dtype,
-                                           post_ops, out_shape_write, lhs_elems, rhs_elems, out_buf)
+                                           post_ops, out_shape_write, lhs_elems, rhs_elems, out_buf, tag=tag)
 
   def _matmul_9x9_hw(self, lhs_bytes: bytes, rhs_bytes: bytes, dtype_read: np.dtype, dtype: DType,
                      np_dtype: np.dtype, post_ops: tuple[tuple[Ops, Any], ...],
-                     out_shape_write: tuple[Any, ...], lhs_elems:int, rhs_elems:int, out_buf: Any) -> float:
+                     out_shape_write: tuple[Any, ...], lhs_elems:int, rhs_elems:int, out_buf: Any,
+                     tag:str="RK_CONV") -> float:
     return self._matmul_stride32_square_hw(9, lhs_bytes, rhs_bytes, dtype_read, dtype, np_dtype,
-                                           post_ops, out_shape_write, lhs_elems, rhs_elems, out_buf)
+                                           post_ops, out_shape_write, lhs_elems, rhs_elems, out_buf, tag=tag)
 
   def _matmul_32x32_hw(self, lhs_bytes: bytes, rhs_bytes: bytes, dtype_read: np.dtype, dtype: DType,
                        np_dtype: np.dtype, post_ops: tuple[tuple[Ops, Any], ...],
-                       out_shape_write: tuple[Any, ...], lhs_elems:int, rhs_elems:int, out_buf: Any) -> float:
+                       out_shape_write: tuple[Any, ...], lhs_elems:int, rhs_elems:int, out_buf: Any,
+                       tag:str="RK_CONV") -> float:
     return self._matmul_stride32_square_hw(32, lhs_bytes, rhs_bytes, dtype_read, dtype, np_dtype,
-                                           post_ops, out_shape_write, lhs_elems, rhs_elems, out_buf)
+                                           post_ops, out_shape_write, lhs_elems, rhs_elems, out_buf, tag=tag)
 
   def _matmul_64x64_hw(self, lhs_bytes: bytes, rhs_bytes: bytes, dtype_read: np.dtype, dtype: DType,
                        np_dtype: np.dtype, post_ops: tuple[tuple[Ops, Any], ...],
-                       out_shape_write: tuple[Any, ...], lhs_elems:int, rhs_elems:int, out_buf: Any) -> float:
+                       out_shape_write: tuple[Any, ...], lhs_elems:int, rhs_elems:int, out_buf: Any,
+                       tag:str="RK_CONV") -> float:
     lhs_mat = np.frombuffer(lhs_bytes, dtype=dtype_read, count=lhs_elems).reshape((64, 64))
     rhs_mat = np.frombuffer(rhs_bytes, dtype=dtype_read, count=rhs_elems).reshape((64, 64))
 
@@ -4781,7 +4876,7 @@ class RockchipProgram:
       ctypes.memset(output_hw.va_addr, 0, output_bytes)
 
       self._program_matmul_64x64(input_hw.meta.dma_addr, weight_hw.meta.dma_addr, output_hw.meta.dma_addr, reset_queue=True)
-      self._submit_conv([list(self.q)])
+      self._submit_conv([list(self.q)], tag=tag)
 
       raw_output = ctypes.string_at(output_hw.va_addr, output_bytes)
       packed_output = np.frombuffer(raw_output, dtype=np.float32, count=output_elems)
@@ -4803,7 +4898,8 @@ class RockchipProgram:
 
   def _matmul_256x256_hw(self, lhs_bytes: bytes, rhs_bytes: bytes, dtype_read: np.dtype, dtype: DType,
                          np_dtype: np.dtype, post_ops: tuple[tuple[Ops, Any], ...],
-                         out_shape_write: tuple[Any, ...], lhs_elems:int, rhs_elems:int, out_buf: Any) -> float:
+                         out_shape_write: tuple[Any, ...], lhs_elems:int, rhs_elems:int, out_buf: Any,
+                         tag:str="RK_CONV") -> float:
     lhs_mat = np.frombuffer(lhs_bytes, dtype=dtype_read, count=lhs_elems).reshape((256, 256))
     rhs_mat = np.frombuffer(rhs_bytes, dtype=dtype_read, count=rhs_elems).reshape((256, 256))
 
@@ -4828,7 +4924,7 @@ class RockchipProgram:
       ctypes.memset(output_hw.va_addr, 0, output_bytes)
 
       self._program_matmul_256x256(input_hw.meta.dma_addr, weight_hw.meta.dma_addr, output_hw.meta.dma_addr, reset_queue=True)
-      self._submit_conv([list(self.q)])
+      self._submit_conv([list(self.q)], tag=tag)
 
       raw_output = ctypes.string_at(output_hw.va_addr, output_bytes)
       packed_output = np.frombuffer(raw_output, dtype=np.float32, count=output_elems)
@@ -6328,6 +6424,46 @@ class RockchipProgram:
       raise RuntimeError("RK_CONV conv2d hardware path returned no result")
     self._finalize_conv_output(out_buf, hw_arr, np_dtype, post_ops, out_shape)
     return 0.0
+
+  def _execute_rk_wmma(self, bufs: tuple[Any, ...], wait: bool=False):
+    assert self._rk_conv_payload is not None
+    tag, dtype, wmma_arg, metadata = self._rk_conv_payload
+    assert tag == "RK_WMMA"
+    lhs_index = metadata["globals_order"].index(metadata["lhs"])
+    rhs_index = metadata["globals_order"].index(metadata["rhs"])
+    out_index = metadata["globals_order"].index(metadata["out"])
+    lhs_buf = bufs[lhs_index]
+    rhs_buf = bufs[rhs_index]
+    out_buf = bufs[out_index]
+    dims = wmma_arg[1] if isinstance(wmma_arg, tuple) and len(wmma_arg) > 1 else None
+    if not isinstance(dims, tuple) or len(dims) != 3:
+      raise RuntimeError("RK_WMMA missing matmul dims")
+    N, M, K = (int(x) for x in dims)
+    if M != N or N != K:
+      raise RuntimeError(f"RK_WMMA only supports square matmul, got {dims}")
+    lhs_elems = M * K
+    rhs_elems = K * N
+    out_shape_write = (M, N)
+    lhs_bytes = self._buffer_as_bytes(lhs_buf)
+    rhs_bytes = self._buffer_as_bytes(rhs_buf)
+    np_dtype, dtype_read, item_size = self._dtype_with_fp16_fallback(dtype, lhs_bytes, rhs_bytes, lhs_elems, rhs_elems)
+    matmul_dims = (M, K, N)
+    if matmul_dims == (8, 8, 8):
+      return self._matmul_8x8_hw(lhs_bytes, rhs_bytes, dtype_read, dtype, np_dtype, tuple(),
+                                 out_shape_write, lhs_elems, rhs_elems, out_buf, tag="RK_WMMA")
+    if matmul_dims == (9, 9, 9):
+      return self._matmul_9x9_hw(lhs_bytes, rhs_bytes, dtype_read, dtype, np_dtype, tuple(),
+                                 out_shape_write, lhs_elems, rhs_elems, out_buf, tag="RK_WMMA")
+    if matmul_dims == (32, 32, 32):
+      return self._matmul_32x32_hw(lhs_bytes, rhs_bytes, dtype_read, dtype, np_dtype, tuple(),
+                                   out_shape_write, lhs_elems, rhs_elems, out_buf, tag="RK_WMMA")
+    if matmul_dims == (64, 64, 64):
+      return self._matmul_64x64_hw(lhs_bytes, rhs_bytes, dtype_read, dtype, np_dtype, tuple(),
+                                   out_shape_write, lhs_elems, rhs_elems, out_buf, tag="RK_WMMA")
+    if matmul_dims == (256, 256, 256):
+      return self._matmul_256x256_hw(lhs_bytes, rhs_bytes, dtype_read, dtype, np_dtype, tuple(),
+                                     out_shape_write, lhs_elems, rhs_elems, out_buf, tag="RK_WMMA")
+    raise RuntimeError(f"RK_WMMA unsupported matmul dims {dims}")
 
 class RockchipRegisterAllocator(HCQAllocatorBase):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer:

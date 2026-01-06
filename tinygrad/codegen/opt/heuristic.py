@@ -86,6 +86,7 @@ def hand_coded_optimizations(k:Scheduler) -> list[Opt]:
 
   # no more opt if we are grouping
   if k.group_for_reduces: return k.applied_opts
+  if k.opts is not None and k.opts.device == "ROCKCHIP": return k.applied_opts
 
   # **** below this line need to be optional and benchmarked ****
 

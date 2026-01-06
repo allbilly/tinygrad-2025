@@ -2999,7 +2999,10 @@ class Tensor(MathTrait):
     ```
     """
     # TODO: make it generic, and same thing to log and cos
-    if self.is_floating_point(): return self.cast(least_upper_dtype(self.dtype, dtypes.float32)).mul(1/math.log(2)).exp2().cast(self.dtype)
+    if self.is_floating_point():
+      if getenv("ROCKCHIP", 0) and self.dtype == dtypes.float16:
+        return self.mul(1/math.log(2)).exp2()
+      return self.cast(least_upper_dtype(self.dtype, dtypes.float32)).mul(1/math.log(2)).exp2().cast(self.dtype)
     # TODO: behavior when DEFAULT_FLOAT is bfloat16 and input is int32?
     return self.mul(1/math.log(2)).exp2()
 
@@ -3124,6 +3127,17 @@ class Tensor(MathTrait):
     """
     # https://personal.math.ubc.ca/~cbm/aands/page_81.htm 4.4.46
     coefficients = [-0.0012624911, 0.0066700901, -0.0170881256, 0.0308918810, -0.0501743046, 0.0889789874, -0.2145988016, 1.5707963050]
+    if self.dtype == dtypes.float16:
+      x = self.cast(dtypes.float32)
+      x_abs = x.abs()
+      coeffs = [Tensor(c, dtype=dtypes.float32, device=x.device) for c in coefficients]
+      acc = Tensor(0.0, dtype=dtypes.float32, device=x.device)
+      for c in coeffs:
+        acc = acc * x_abs + c
+      one = Tensor(1.0, dtype=dtypes.float32, device=x.device)
+      half_pi = Tensor(math.pi / 2, dtype=dtypes.float32, device=x.device)
+      y = half_pi - (one - x_abs).sqrt() * acc
+      return (x.sign() * y).cast(self.dtype)
     x = math.pi / 2 - (1.0 - self.abs()).sqrt() * polyN(self.abs(), coefficients)
     return self.sign() * x
 
@@ -3448,6 +3462,11 @@ class Tensor(MathTrait):
     print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).acosh().numpy())
     ```
     """
+    if getenv("ROCKCHIP") and self.dtype == dtypes.float16:
+      base = (self + (self.square() - 1).sqrt()).log()
+      approx = (self * 2).log()
+      out = (self > 200).where(approx, base)
+      return (self < 1).where(self.full_like(math.nan), out)
     return (self + (self.square() - 1).sqrt()).log()
 
   def hardtanh(self, min_val=-1, max_val=1) -> Tensor:

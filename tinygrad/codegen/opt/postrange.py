@@ -1,7 +1,7 @@
 from __future__ import annotations
 import math, itertools
 from collections import defaultdict
-from typing import cast, Final
+from typing import Any, cast, Final
 from tinygrad.uop.ops import PatternMatcher, UPat, Ops, UOp, KernelInfo, graph_rewrite, AxisType, ssimplify, can_pad
 from tinygrad.device import Buffer
 from tinygrad.dtype import AddrSpace, dtypes, ImageDType
@@ -267,7 +267,15 @@ class Scheduler:
             # TODO: remove tc_upcast_axes from the arg
             # do the reduce_axes always disappear? i think they don't
             # they need to be moved into the WMMA srcs
-            wmma_arg = (str(tc), tc.dims, tc.dtype_in, tc.dtype_out, self.opts.device, tc.threads, tc_upcast_axes, ()) #, tc_reduce_axes)
+            wmma_extra: Any = ()
+            if self.opts.device == "ROCKCHIP":
+              N, M, K = tc.dims
+              if M == N and N == K:
+                if N in (8, 9, 32):
+                  wmma_extra = {"rockchip": {"align_in": 32, "align_out": 32, "out_height": int(N)}}
+                elif N in (64, 256):
+                  wmma_extra = {"rockchip": {"align_in": int(N), "align_out": int(N), "out_height": int(N)}}
+            wmma_arg = (str(tc), tc.dims, tc.dtype_in, tc.dtype_out, self.opts.device, tc.threads, tc_upcast_axes, wmma_extra) #, tc_reduce_axes)
             wmma = UOp(Ops.WMMA, dtype=tc.dtype_out.vec(tc.elements_per_thread[2]), src=(
               UOp(Ops.CONTRACT, dtype=srcs[0].dtype.vec(tc.elements_per_thread[0]), src=(srcs[0],), arg=tc_upcast_axes[0], tag=1),
               UOp(Ops.CONTRACT, dtype=srcs[1].dtype.vec(tc.elements_per_thread[1]), src=(srcs[1],), arg=tc_upcast_axes[1], tag=1),

@@ -2,7 +2,7 @@ from typing import Callable
 import math, functools
 from tinygrad.dtype import dtypes, DType, promo_lattice
 from tinygrad.device import is_dtype_supported
-from tinygrad.helpers import polyN, DISABLE_FAST_IDIV
+from tinygrad.helpers import getenv, polyN, DISABLE_FAST_IDIV
 from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher
 
 TRANSCENDENTAL_DTYPES = (dtypes.float16, dtypes.float32, dtypes.float64)
@@ -62,6 +62,52 @@ def frexp(v:UOp) -> tuple[UOp, UOp]:
   mantissa = ((bits & m1) | m2).bitcast(v.dtype)
   exp = exponent - exponent_bias(v.dtype) + 1
   return mantissa, exp
+
+def rockchip_sqrt(d:UOp) -> UOp:
+  assert d.dtype.scalar() in TRANSCENDENTAL_DTYPES
+  calc_dtype = dtypes.float32 if d.dtype.scalar() == dtypes.float16 else d.dtype
+  x = d.cast(calc_dtype) if calc_dtype != d.dtype else d
+  zero = x.const_like(0.0)
+  one = x.const_like(1.0)
+  half = x.const_like(0.5)
+  y = (x < one).where(one, x)
+  iters = 12 if d.dtype.scalar() == dtypes.float16 else 16
+  for _ in range(iters):
+    y = (y + x / y) * half
+  y = x.eq(zero).where(zero, y)
+  y = (x < zero).where(x.const_like(math.nan), y)
+  return y.cast(d.dtype) if y.dtype != d.dtype else y
+
+def rockchip_log2(d:UOp) -> UOp:
+  assert d.dtype.scalar() in TRANSCENDENTAL_DTYPES
+  zero = d.const_like(0.0)
+  one = d.const_like(1.0)
+  two = d.const_like(2.0)
+  pos = zero < d
+  x = pos.where(d, one)
+  e = x.const_like(0.0)
+  steps = (8, 4, 2, 1) if d.dtype.scalar() == dtypes.float16 else (64, 32, 16, 8, 4, 2, 1)
+  for p in steps:
+    c = x.const_like(2.0 ** p)
+    lt = x < c
+    x = lt.where(x, x * (2.0 ** -p))
+    e = lt.where(e, e + p)
+  for p in steps:
+    c = x.const_like(2.0 ** -p)
+    lt = x < c
+    x = lt.where(x * (2.0 ** p), x)
+    e = lt.where(e - p, e)
+  lt = x < one
+  x = lt.where(x * two, x)
+  e = lt.where(e - 1.0, e)
+  y = (x - one) / (x + one)
+  y2 = y * y
+  poly = (y2 * (1.0/5.0) + (1.0/3.0)) * y2 + one
+  r = e + y * poly * 2.8853900817779268
+  r = pos.where(r, r.const_like(-math.inf))
+  r = (d < zero).where(r.const_like(math.nan), r)
+  r = (d < math.inf).where(r, r.const_like(math.inf))
+  return d.ne(d).where(r.const_like(math.nan), r)
 
 # *** reduction algorithms for sine ***
 def payne_hanek_reduction(d:UOp) -> tuple[UOp, UOp]:
@@ -197,6 +243,29 @@ def xexp2(d:UOp) -> UOp:
   - Paper: https://arxiv.org/pdf/2001.09258
   """
   assert d.dtype.scalar() in TRANSCENDENTAL_DTYPES
+  rockchip_fast = bool(getenv("ROCKCHIP", 0))
+  if rockchip_fast and d.dtype.scalar() == dtypes.float16:
+    x = _lazy_map_numbers(d, d.const_like(0.0), d.const_like(0.0), d.const_like(0.0), d)
+    q = rintk(x)
+    s = x - q.cast(x.dtype)
+    u = polyN(s, [0.009618129107628477, 0.055504108664821576, 0.2402265069591007, 0.6931471805599453, 1.0])
+    u = u * pow2if(q, x.dtype)
+    upper, lower = (23, -22)
+    u = (d >= upper).where(d.const_like(math.inf), u)
+    u = (d < lower).where(d.const_like(0.0), u)
+    u = d.ne(d).where(d.const_like(math.nan), u)
+    return u
+  if rockchip_fast and d.dtype.scalar() == dtypes.float32:
+    x = d.cast(dtypes.float32)
+    u = polyN(x, [2.5678435993488196e-11, 4.44553827187081e-10, 7.054911620801121e-09, 1.0178086009239696e-07,
+                  1.3215486790144305e-06, 1.5252733804059838e-05, 0.00015403530393381606, 0.0013333558146428441,
+                  0.009618129107628477, 0.055504108664821576, 0.2402265069591007, 0.6931471805599453, 1.0])
+    u = u.cast(d.dtype)
+    upper, lower = {dtypes.float32: (128, -150), dtypes.float16: (23, -22)}[d.dtype.scalar()]
+    u = (d >= upper).where(d.const_like(math.inf), u)
+    u = (d < lower).where(d.const_like(0.0), u)
+    u = d.ne(d).where(d.const_like(math.nan), u)
+    return u
   # mask +=inf/nan as zero.
   x = _lazy_map_numbers(d, d.const_like(0.0), d.const_like(0.0), d.const_like(0.0), d)
   q = rintk(x)
@@ -215,7 +284,8 @@ def xexp2(d:UOp) -> UOp:
   # Replace x < lower with zero.
   u = (d<lower).where(d.const_like(0.0), u)
   # exp2(NaN) = NaN
-  return d.ne(d).where(d.const_like(math.nan), u)
+  u = d.ne(d).where(d.const_like(math.nan), u)
+  return u
 
 def xlog2(d:UOp) -> UOp:
   """
@@ -321,6 +391,7 @@ powers_of_two = {2**i:i for i in range(64)}
 def get_late_rewrite_patterns(ops:tuple[Ops, ...], force_transcendental=False):
   pat: list[tuple[UPat, Callable]] = []
   for op,f in ((Ops.EXP2, xexp2), (Ops.LOG2, xlog2), (Ops.SIN, xsin)):
+    if op is Ops.LOG2: f = lambda ctx, d: rockchip_log2(d) if ctx == "ROCKCHIP" else xlog2(d)
     if op not in ops or force_transcendental:
       pat += [(UPat(op, dtype=TRANSCENDENTAL_DTYPES, src=(UPat.var("d"),)), f),
               (UPat(op, dtype=tuple(dt for dt in dtypes.floats if dt not in TRANSCENDENTAL_DTYPES), src=(UPat.var("d"),), name="x"),
@@ -330,7 +401,8 @@ def get_late_rewrite_patterns(ops:tuple[Ops, ...], force_transcendental=False):
   # MAX can be rewritten as CMPLT + WHERE (max function is annoying on many cstyle backends)
   if Ops.MAX not in ops and Ops.CMPLT in ops: pat.append((UPat(Ops.MAX, name="m"), lambda m: (m.src[0] < m.src[1]).where(m.src[1], m.src[0])))
   # rewrite SQRT to xpow 0.5
-  if Ops.SQRT not in ops: pat.append((UPat(Ops.SQRT, src=UPat.var("d")), lambda d: xpow(d, d.const_like(0.5))))
+  if Ops.SQRT not in ops: pat.append((UPat(Ops.SQRT, src=UPat.var("d")),
+                                      lambda ctx, d: rockchip_sqrt(d) if ctx == "ROCKCHIP" else xpow(d, d.const_like(0.5))))
   # rewrite MOD to AND (which should always be supported, but not for generic in tests): x % (2**y) -> x & (2**y-1)
   if Ops.AND in ops: pat += [(UPat.var("x", dtypes.ints)%UPat.cvar("c"), lambda x,c: x & (c.arg-1) if c.arg in powers_of_two else None)]
   if Ops.OR in ops: pat += [(UPat.var("x", dtypes.bool).logical_not()&UPat.var("y", dtypes.bool).logical_not(),
