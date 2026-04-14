@@ -30,6 +30,7 @@ NPU_CBUF_BANK_SIZE = 32768
 NPU_CBUF_BANKS = 12
 MATMUL_CHANNEL_ALIGN = 32
 MATMUL_THREAD_CHUNK = 8
+REGCMD_RESERVED = 16384
 PC_ENABLE = 0x01
 PC_ENABLE_CNA = 0x04
 PC_ENABLE_DPU = 0x08
@@ -134,6 +135,45 @@ def _feature_fp16_index(channels:int, height:int, channel_idx:int, row_idx:int, 
   offset = (c - 1) % chunk
   return src + chunk * (h - 1) + offset
 
+def _matmul_align(value:int) -> int:
+  return max(_align_up(value, MATMUL_CHANNEL_ALIGN), MATMUL_CHANNEL_ALIGN)
+
+def _pack_matmul_input_nc1hwc2(dst:np.ndarray, src:np.ndarray, rows:int, cols:int, align_in:int, c2:int) -> None:
+  for m in range(rows):
+    for k in range(cols):
+      plane = k // c2
+      offset = k % c2
+      dst[(plane * rows + m) * c2 + offset] = src[m, k]
+
+def _pack_matmul_weights(dst:np.ndarray, src:np.ndarray, K:int, N:int, align_in:int) -> None:
+  if K == 9 and N == 9:
+    for n in range(N):
+      base = n * align_in
+      for k in range(K):
+        dst[base + k] = src[k, n]
+    return
+  if K == 32 and N == 32 and align_in == 32:
+    for n in range(N):
+      base = n * align_in
+      for k in range(K):
+        dst[base + k] = src[k, n]
+    return
+  for n in range(N):
+    for k in range(K):
+      idx = _weight_fp16_index(align_in, n, k)
+      if idx < dst.size:
+        dst[idx] = src[k, n]
+
+def _unpack_matmul_output_fp32(src:np.ndarray, M:int, N:int, align_out:int, c2:int) -> np.ndarray:
+  planes = (N + c2 - 1) // c2
+  reshaped = src.reshape(planes, M, c2)
+  decoded = np.zeros((M, N), dtype=np.float32)
+  for plane in range(planes):
+    n_start = plane * c2
+    n_end = min(n_start + c2, N)
+    decoded[:, n_start:n_end] = reshaped[plane, :, :n_end - n_start]
+  return decoded
+
 def _npuop(op:int, value:int, reg:int) -> int:
   return ((op & 0xffff) << 48) | ((value & 0xffffffff) << 16) | (reg & 0xffff)
 
@@ -146,45 +186,88 @@ def _gen_matmul_fp16(params:MatmulParams) -> int:
   output_dma = int(params.output_dma)
   fp32tofp16 = int(params.fp32tofp16 & 0x1)
 
+  align_in = _matmul_align(k)
+  align_out = _matmul_align(n)
   datain_width = 1
   datain_height = m
-  datain_channel = k
   dataout_width = 1
   dataout_height = m
   weight_width = 1
   weight_height = 1
-  weight_kernels = n
+  weight_kernels = align_out
 
-  weight_bytes_per_kernel = weight_width * weight_height * datain_channel * ctypes.sizeof(ctypes.c_uint16)
-  weight_bytes = weight_bytes_per_kernel * weight_kernels
-  fd_bytes = datain_width * datain_height * datain_channel * ctypes.sizeof(ctypes.c_uint16)
+  weight_bytes_per_kernel = align_in * ctypes.sizeof(ctypes.c_uint16)
+  weight_bytes = weight_bytes_per_kernel * align_out
+  fd_bytes = datain_width * datain_height * align_in * ctypes.sizeof(ctypes.c_uint16)
 
   fd_banks = (fd_bytes + NPU_CBUF_BANK_SIZE - 1) // NPU_CBUF_BANK_SIZE
-  weight_banks = (weight_bytes + NPU_CBUF_BANK_SIZE - 1) // NPU_CBUF_BANK_SIZE
+  if fd_banks == 0:
+    fd_banks = 1
   if fd_banks > NPU_CBUF_BANKS - 1:
-    return -1
-  if weight_bytes_per_kernel <= NPU_CBUF_BANK_SIZE:
-    weight_banks = NPU_CBUF_BANKS - fd_banks
-  else:
-    return -2
+    fd_banks = NPU_CBUF_BANKS - 1
+  weight_banks = NPU_CBUF_BANKS - fd_banks
 
-  data_entries = (datain_width * datain_channel + 31) // 32
+  data_entries = (datain_width * align_in + 31) // 32
   line_stride = datain_width * 4
-  surf_stride = line_stride * ((datain_height // 4) - 1)
-  if surf_stride < 0:
-    surf_stride += 1
+  if k > 32 and k < 512 and k != 64 and k != 256:
+    stride_steps = (k + 31) // 32
+    if stride_steps > 13:
+      stride_steps = 13
+    line_stride = stride_steps * 4
+  surf_groups = datain_height // 4
+  surf_stride = line_stride * (surf_groups - 1) + (1 if surf_groups == 0 else 0)
+  if align_in < 64:
+    surf_stride = 0
+  if k > 32 and k < 64:
+    surf_stride = 0
+  elif k > 64 and k <= 128:
+    surf_stride = 0
+  elif k > 128 and k < 256:
+    surf_stride = 0
+  elif k > 256 and k < 512:
+    surf_stride = 0
+  if k > 7872:
+    feature_grains = 2
+  elif k > 128 and k <= 192:
+    feature_grains = datain_height
+  elif k > 192 and k != 256:
+    denom = align_in * ctypes.sizeof(ctypes.c_uint16)
+    grains = (2 * NPU_CBUF_BANK_SIZE + denom - 1) // denom
+    grains = (grains + 1) & ~1
+    if grains < 80:
+      grains = 80
+    feature_grains = grains
+  else:
+    feature_grains = datain_height + 1
+
+  is_kn_64 = (k == 64 and n == 64)
+  is_kn_256 = (k == 256 and n == 256)
+  is_kn_512 = (k == 512 and n == 512)
+  is_kn_lg_512 = (k > 512 and n > 512)
+  is_matmul_64 = (m == 64 and k == 64 and n == 64)
+  is_matmul_256 = (m == 256 and k == 256 and n == 256)
+  is_matmul_768 = (m == 1 and k == 768 and n == 768)
+  is_matmul_768_2048 = (m == 1 and k == 768 and n == 2048)
+  is_matmul_2048 = (m == 1 and k == 2048 and n == 2048)
+  dst_surf_stride = 64 if is_matmul_64 else (256 if is_matmul_256 else 1)
+  notch_val = 0 if (is_kn_64 or is_kn_256 or is_kn_512 or k > 7872) else 7
+  if k > 32 and k < 512 and k != 64 and k != 256:
+    notch_steps = (k - 1) // 32
+    if notch_steps > 12:
+      notch_steps = 12
+    notch_val = 7 + 8 * notch_steps
 
   cna = {
     "proc_precision": PRECISION_FLOAT16,
     "in_precision": PRECISION_FLOAT16,
     "conv_mode": DIRECT_CONVOLUTION,
     "kernel_groups": 0,
-    "feature_grains": m + 1,
+    "feature_grains": feature_grains,
     "conv_x_stride": 1,
     "conv_y_stride": 1,
     "datain_width": datain_width,
     "datain_height": datain_height,
-    "datain_channel": datain_channel,
+    "datain_channel": align_in,
     "dataout_width": dataout_width,
     "dataout_height": dataout_height,
     "dataout_atomics": dataout_width * dataout_height,
@@ -215,8 +298,8 @@ def _gen_matmul_fp16(params:MatmulParams) -> int:
     "surf_stride": surf_stride,
     "dma_width": datain_width,
     "dma_height": datain_height,
-    "dma_channel": datain_channel,
-    "decompress_addr0": weights_dma,
+    "dma_channel": align_in,
+    "decompress_addr0": weights_dma + REGCMD_RESERVED,
   }
 
   core = {
@@ -227,7 +310,6 @@ def _gen_matmul_fp16(params:MatmulParams) -> int:
     "dataout_channel": max(weight_kernels - 1, 0),
   }
 
-  dst_surf_stride = dataout_height * dataout_width
   convert_out = PRECISION_FLOAT16 if fp32tofp16 else PRECISION_FLOAT32
   size_e_val = 1 if fp32tofp16 else 3
   surf_add_scale = 2 if fp32tofp16 else 4
@@ -268,6 +350,7 @@ def _gen_matmul_fp16(params:MatmulParams) -> int:
     "height_wdma": core["dataout_height"],
     "channel_wdma": core["dataout_channel"],
     "surf_add": dst_surf_stride * surf_add_scale,
+    "notch_addr": notch_val,
   }
 
   tasks = params.tasks
@@ -277,6 +360,8 @@ def _gen_matmul_fp16(params:MatmulParams) -> int:
   ops:list[int] = []
   ops.append(_npuop(OP_REG_DPU, 0xE, rk.REG_DPU_S_POINTER))
   value = ((cna["proc_precision"] & 0x7) << 7) | ((cna["in_precision"] & 0x7) << 4) | (cna["conv_mode"] & 0xf)
+  if not (is_kn_64 or is_kn_256 or is_kn_512 or is_kn_lg_512 or is_matmul_768 or is_matmul_768_2048 or is_matmul_2048):
+    value |= 1 << rk.CNA_CONV_CON1_GROUP_LINE_OFF__SHIFT
   ops.append(_npuop(OP_REG_CNA, value, rk.REG_CNA_CONV_CON1))
   value = ((cna["kernel_groups"] & 0xFF) << 16) | ((cna["feature_grains"] & 0x3FF) << 4)
   ops.append(_npuop(OP_REG_CNA, value, rk.REG_CNA_CONV_CON2))
@@ -345,7 +430,8 @@ def _gen_matmul_fp16(params:MatmulParams) -> int:
   ops.append(_npuop(OP_REG_DPU, (dpu["dst_surf_stride"] & 0xFFFFFFF) << 4, rk.REG_DPU_DST_SURF_STRIDE))
   ops.append(_npuop(OP_REG_DPU, dpu["width"] & 0x1FFF, rk.REG_DPU_DATA_CUBE_WIDTH))
   ops.append(_npuop(OP_REG_DPU, dpu["height"] & 0x1FFF, rk.REG_DPU_DATA_CUBE_HEIGHT))
-  ops.append(_npuop(OP_REG_DPU, 0x0, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR))
+  value = ((dpu["notch_addr"] & 0x1FFF) << rk.DPU_DATA_CUBE_NOTCH_ADDR_NOTCH_ADDR_1__SHIFT) | (dpu["notch_addr"] & 0x1FFF)
+  ops.append(_npuop(OP_REG_DPU, value, rk.REG_DPU_DATA_CUBE_NOTCH_ADDR))
   value = ((dpu["channel"] & 0x1FFF) << 16) | (dpu["channel"] & 0x1FFF)
   ops.append(_npuop(OP_REG_DPU, value, rk.REG_DPU_DATA_CUBE_CHANNEL))
   value = ((dpu["bs_relu_bypass"] & 0x1) << 6) | ((dpu["bs_mul_bypass"] & 0x1) << 4) | ((dpu["bs_alu_bypass"] & 0x1) << 1) | (dpu["bs_bypass"] & 0x1)
@@ -916,60 +1002,50 @@ class RockchipProgram:
         print("matmul buffer prep failed", exc)
       raise
 
-    Mpad = max(_align_up(M, MATMUL_CHANNEL_ALIGN), MATMUL_CHANNEL_ALIGN)
-    Kpad = max(_align_up(K, MATMUL_CHANNEL_ALIGN), MATMUL_CHANNEL_ALIGN)
-    Npad = max(_align_up(N, MATMUL_CHANNEL_ALIGN), MATMUL_CHANNEL_ALIGN)
+    align_in = _matmul_align(K)
+    align_out = _matmul_align(N)
 
-    feature_arr = np.zeros((Mpad * Kpad,), dtype=np.float16)
-    for m in range(M):
-      for k in range(K):
-        feature_arr[_feature_fp16_index(Kpad, Mpad, k, m)] = a[m, k]
+    feature_arr = np.zeros((align_in * M,), dtype=np.float16)
+    if M == 64 and K == 64 and N == 64:
+      _pack_matmul_input_nc1hwc2(feature_arr, a, M, K, align_in, 8)
+    elif M == 256 and K == 256 and N == 256:
+      _pack_matmul_input_nc1hwc2(feature_arr, a, M, K, align_in, 8)
+    else:
+      for m in range(M):
+        row_base = m * align_in
+        for k in range(K):
+          feature_arr[row_base + k] = a[m, k]
 
-    weight_arr = np.zeros((Npad * Kpad,), dtype=np.float16)
-    for n in range(N):
-      for k in range(K):
-        weight_arr[_weight_fp16_index(Kpad, n, k)] = b[k, n]
-
-    key = (Mpad, Kpad, Npad)
+    weight_arr = np.zeros((align_in * align_out,), dtype=np.float16)
+    _pack_matmul_weights(weight_arr, b, K, N, align_in)
+    weight_size = REGCMD_RESERVED + _align_up(weight_arr.nbytes, 64)
+    key = (M, K, N)
     if key not in self.matmul_bufs:
       input_buf = self.device._gpu_alloc(feature_arr.nbytes, 0)
-      weight_buf = self.device._gpu_alloc(weight_arr.nbytes, 0)
-      output_buf = self.device._gpu_alloc(Mpad * Npad * ctypes.sizeof(ctypes.c_float), 0)
+      weight_buf = self.device._gpu_alloc(weight_size, 0)
+      output_buf = self.device._gpu_alloc(align_out * M * ctypes.sizeof(ctypes.c_float), 0)
       self.matmul_bufs[key] = (input_buf, weight_buf, output_buf)
     else:
       input_buf, weight_buf, output_buf = self.matmul_bufs[key]
 
     ctypes.memmove(input_buf.va_addr, feature_arr.tobytes(), feature_arr.nbytes)
-    ctypes.memmove(weight_buf.va_addr, weight_arr.tobytes(), weight_arr.nbytes)
+    ctypes.memset(weight_buf.va_addr, 0, weight_buf.size)
+    ctypes.memmove(weight_buf.va_addr + REGCMD_RESERVED, weight_arr.tobytes(), weight_arr.nbytes)
     ctypes.memset(output_buf.va_addr, 0, output_buf.size)
     if getenv("DEBUG") >= 3:
       print("matmul dma", hex(input_buf.meta.dma_addr), hex(weight_buf.meta.dma_addr), hex(output_buf.meta.dma_addr))
 
-    q_vals = self._build_matmul_queue(Mpad, Kpad, Npad,
+    q_vals = self._build_matmul_queue(M, K, N,
       input_buf.meta.dma_addr, weight_buf.meta.dma_addr, output_buf.meta.dma_addr)
     self._submit_queue(q_vals, op_idx=0, enable_mask=0xd)
 
-    out_bytes = ctypes.create_string_buffer(Mpad * Npad * ctypes.sizeof(ctypes.c_float))
+    out_bytes = ctypes.create_string_buffer(align_out * M * ctypes.sizeof(ctypes.c_float))
     ctypes.memmove(out_bytes, output_buf.va_addr, out_bytes._length_)
-    out_mat = np.frombuffer(out_bytes, dtype=np.float32).reshape(Mpad, Npad)
-    if getenv("DEBUG") >= 3:
-      coords = [(i, j, out_mat[i, j]) for i in range(Mpad) for j in range(Npad) if not np.isclose(out_mat[i, j], 0)]
-      print("raw matmul nonzero coords", coords[:32])
+    out_mat = np.frombuffer(out_bytes, dtype=np.float32)
     if getenv("ROCKCHIP_DUMP_RAW"):
       np.save("/tmp/rockchip_matmul_raw.npy", out_mat)
-    decoded = np.zeros((Mpad, Npad), dtype=np.float32)
-    # Rockchip stores the matmul tile as interleaved grids: ri mod 4 picks a block of (Mpad//4) rows
-    # and ri // 4 selects a group of 4 columns. Within each tile ci // 4 steps through rows and ci % 4
-    # picks the column inside the group.
-    row_tile = Mpad // 4
-    for ri in range(Mpad):
-      for ci in range(Npad):
-        val = out_mat[ri, ci]
-        if val == 0: continue
-        row_idx = (ri % 4) * row_tile + (ci // 4)
-        col_idx = (ri // 4) * 4 + (ci % 4)
-        if row_idx < Mpad and col_idx < Npad:
-          decoded[row_idx, col_idx] = val
+    c2 = 4 if ((M == 64 and K == 64 and N == 64) or (M == 256 and K == 256 and N == 256)) else align_out
+    decoded = _unpack_matmul_output_fp32(out_mat, M, N, align_out, c2)
     trimmed_fp32 = decoded[:M, :N]
     debug_level = getenv("DEBUG")
     ref_fp32 = None
@@ -1873,18 +1949,13 @@ class RockchipProgram:
       out_mv[:] = out_bytes
     return True
 
-  def _build_matmul_queue(self, Mpad:int, Kpad:int, Npad:int,
+  def _build_matmul_queue(self, M:int, K:int, N:int,
                           input_dma:int, weight_dma:int, output_dma:int) -> list[int]:
-    if (Mpad % MATMUL_CHANNEL_ALIGN != 0 or
-        Kpad % MATMUL_CHANNEL_ALIGN != 0 or
-        Npad % MATMUL_CHANNEL_ALIGN != 0):
-      raise RuntimeError("unsupported matmul configuration for Rockchip template")
-
     tasks_arr = (ctypes.c_uint64 * 112)()
     params = MatmulParams()
-    params.m = Mpad
-    params.k = Kpad
-    params.n = Npad
+    params.m = M
+    params.k = K
+    params.n = N
     params.input_dma = input_dma & 0xffffffff
     params.weights_dma = weight_dma & 0xffffffff
     params.output_dma = output_dma & 0xffffffff
